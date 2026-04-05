@@ -48,6 +48,7 @@ def db_init():
         );
         CREATE TABLE IF NOT EXISTS messages (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            msg_type  TEXT NOT NULL DEFAULT 'message',
             from_user TEXT NOT NULL,
             to_user   TEXT NOT NULL,
             payload   TEXT NOT NULL,   -- JSON зашифрованный блоб
@@ -63,6 +64,9 @@ def db_init():
             ts        INTEGER
         );
         """)
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(messages)").fetchall()}
+        if "msg_type" not in cols:
+            c.execute("ALTER TABLE messages ADD COLUMN msg_type TEXT NOT NULL DEFAULT 'message'")
     log.info("БД инициализирована")
 
 
@@ -162,10 +166,11 @@ async def handler(websocket):
                 await _deliver_pending(username, websocket)
 
             # ── Отправить сообщение ──────────────────────────
-            elif t == "message":
+            elif t in ("message", "image_message"):
                 to      = msg.get("to", "")
                 payload = msg.get("payload")
                 ts      = msg.get("ts") or int(time.time()*1000)
+                group_id = msg.get("group_id")
 
                 if not to or not payload:
                     continue
@@ -184,19 +189,23 @@ async def handler(websocket):
 
                 with db_conn() as c:
                     cur = c.execute(
-                        "INSERT INTO messages (from_user,to_user,payload,ts) VALUES (?,?,?,?)",
-                        (username, to, json.dumps(payload), ts)
+                        "INSERT INTO messages (msg_type,from_user,to_user,payload,ts) VALUES (?,?,?,?,?)",
+                        (t, username, to, json.dumps(payload), ts)
                     )
                     server_id = str(cur.lastrowid)
 
                 # Пытаемся доставить онлайн
-                delivered = await send_to(to, {
-                    "type":      "message",
+                out_msg = {
+                    "type":      t,
                     "from":      username,
                     "payload":   payload,
                     "ts":        ts,
                     "server_id": server_id,
-                })
+                }
+                if group_id:
+                    out_msg["group_id"] = group_id
+
+                delivered = await send_to(to, out_msg)
                 if delivered:
                     with db_conn() as c:
                         c.execute("UPDATE messages SET delivered=1 WHERE id=?",
@@ -324,7 +333,7 @@ async def _deliver_pending(username: str, websocket):
         try:
             payload = json.loads(row["payload"])
             await websocket.send(json.dumps({
-                "type":      "message",
+                "type":      row["msg_type"] if row["msg_type"] else "message",
                 "from":      row["from_user"],
                 "payload":   payload,
                 "ts":        row["ts"],

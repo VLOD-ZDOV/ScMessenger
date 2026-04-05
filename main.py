@@ -6,6 +6,7 @@ SCmess — E2E-зашифрованный мессенджер
 """
 
 import os, io, json, base64, threading, hashlib, time, sqlite3, re
+from collections import deque
 from datetime import datetime
 
 from kivy.config import Config
@@ -185,12 +186,12 @@ KV = """
             size_hint_y: None
             height: dp(16)
         StyledButton:
-            text: '＋  Создать аккаунт'
+            text: 'Создать аккаунт'
             size_hint_y: None
             height: dp(52)
             on_release: root.open_create_account()
         StyledButton:
-            text: '🔒  Настроить PIN-код'
+            text: 'Настроить PIN-код'
             size_hint_y: None
             height: dp(44)
             on_release: root.setup_pin()
@@ -1212,7 +1213,7 @@ class MessageDB:
                 (peer, direction, text, ts, status, server_id,
                  1 if is_group else 0, group_id, media_type, media_path,
                  media_thumb, img_w, img_h))
-            preview = "📷 Фото" if media_type == "image" else text
+            preview = "Фото" if media_type == "image" else text
             c.execute(
                 "INSERT OR REPLACE INTO chats (peer,last_msg,last_ts,unread,is_group) "
                 "VALUES (?,?,?, COALESCE((SELECT unread FROM chats WHERE peer=?),0)"
@@ -1313,6 +1314,10 @@ class WSClient:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(10)
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except Exception:
+                pass
             s.connect((host, int(port)))
             # WS Handshake
             key = base64.b64encode(os.urandom(16)).decode()
@@ -1456,6 +1461,8 @@ class WSClient:
             return True
         except Exception:
             self.connected = False
+            if self._reconnect_enabled and self._last_host:
+                self._schedule_reconnect()
             return False
 
     def _schedule_reconnect(self):
@@ -1500,6 +1507,7 @@ class NetworkManager:
         self._priv_key_path = ""
         self._pub_key_pem   = ""
         self._on_done = None
+        self._offline_queue = deque(maxlen=300)
 
         self.on_status_change    = None
         self.on_incoming_message = None
@@ -1546,6 +1554,7 @@ class NetworkManager:
             if self._on_done:
                 self._on_done(True, None)
             self.ws.send({"type": "get_pending"})
+            self._flush_offline_queue()
 
         elif t == "auth_error":
             if self._on_done:
@@ -1629,7 +1638,7 @@ class NetworkManager:
             with open(img_path, "wb") as f:
                 f.write(file_data)
             thumb_b64, sz = app.backend.make_thumb(file_data)
-            app.db.add_message(peer, "in", "📷 Фото", ts=ts, status="delivered",
+            app.db.add_message(peer, "in", "Фото", ts=ts, status="delivered",
                                server_id=sid, media_type="image",
                                media_path=img_path, media_thumb=thumb_b64,
                                img_w=sz[0], img_h=sz[1])
@@ -1644,7 +1653,7 @@ class NetworkManager:
         try:
             payload = app.backend.encrypt_for(pub_key_path, text)
             ts = int(time.time() * 1000)
-            self.ws.send({"type": "message", "to": to, "payload": payload, "ts": ts})
+            self._send_or_queue({"type": "message", "to": to, "payload": payload, "ts": ts})
             return ts
         except Exception as e:
             print(f"[WS] send error: {e}")
@@ -1655,12 +1664,41 @@ class NetworkManager:
         try:
             payload = app.backend.encrypt_file(file_data, pub_key_path)
             ts = int(time.time() * 1000)
-            self.ws.send({"type": "image_message", "to": to,
-                          "payload": payload, "ts": ts})
+            self._send_or_queue({"type": "image_message", "to": to,
+                                 "payload": payload, "ts": ts})
             return ts
         except Exception as e:
             print(f"[WS] send image error: {e}")
             return None
+
+    def send_group_message(self, to: str, text: str, pub_key_path: str, group_id: str, ts: int):
+        app = App.get_running_app()
+        try:
+            payload = app.backend.encrypt_for(pub_key_path, text)
+            self._send_or_queue({
+                "type": "message", "to": to, "payload": payload,
+                "ts": ts, "group_id": group_id,
+            })
+            return True
+        except Exception as e:
+            print(f"[WS] group send error: {e}")
+            return False
+
+    def _send_or_queue(self, msg: dict):
+        sent = self.ws.send(msg)
+        if not sent:
+            self._offline_queue.append(msg)
+        return sent
+
+    def _flush_offline_queue(self):
+        if not self.ws.connected or not self._offline_queue:
+            return
+        items = list(self._offline_queue)
+        self._offline_queue.clear()
+        for m in items:
+            if not self.ws.send(m):
+                self._offline_queue.appendleft(m)
+                break
 
     def request_contact(self, username: str):
         self.ws.send({"type": "contact_request", "to": username})
@@ -1704,7 +1742,17 @@ class LaunchScreen(Screen):
                 halign="center", text_size=(Window.width * 0.8, None)))
             return
         for acc in accounts:
-            row = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(10))
+            row = BoxLayout(size_hint_y=None, height=dp(68), spacing=dp(10),
+                            padding=[dp(12), dp(8), dp(12), dp(8)])
+            with row.canvas.before:
+                Color(*t["btn_bg"])
+                RoundedRectangle(pos=row.pos, size=row.size, radius=[12])
+            row.bind(pos=lambda i, *_: _upd_row_bg(i), size=lambda i, *_: _upd_row_bg(i))
+            def _upd_row_bg(inst):
+                inst.canvas.before.clear()
+                with inst.canvas.before:
+                    Color(*t["btn_bg"])
+                    RoundedRectangle(pos=inst.pos, size=inst.size, radius=[12])
             ava = make_avatar(acc["username"], dp(44), acc.get("avatar"))
             row.add_widget(ava)
             info = BoxLayout(orientation="vertical")
@@ -1719,7 +1767,7 @@ class LaunchScreen(Screen):
                                       text_size=(Window.width * 0.65, None)))
             row.add_widget(info)
 
-            outer = Button(size_hint_y=None, height=dp(60),
+            outer = Button(size_hint=(1, None), height=dp(68),
                            background_normal="", background_color=[0,0,0,0])
             outer.add_widget(row)
             outer.bind(on_release=lambda _, a=acc: self._select_account(a))
@@ -1851,7 +1899,7 @@ class ServerScreen(Screen):
             lbl.text  = f"✓  Подключено {name} → {app.net.host}:{app.net.port}"
             lbl.color = app.theme["success_bg"]
         else:
-            lbl.text  = "○  Нет подключения"
+            lbl.text  = "Нет подключения"
             lbl.color = app.theme["label_muted"]
 
     def do_connect(self):
@@ -2380,17 +2428,28 @@ def _request_image_pick(on_path):
         from android import activity
         from jnius import autoclass
 
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        BuildVersion   = autoclass("android.os.Build$VERSION")
+
+        permissions = []
+        if BuildVersion.SDK_INT >= 33:
+            permissions.append("android.permission.READ_MEDIA_IMAGES")
+        else:
+            permissions.append(Permission.READ_EXTERNAL_STORAGE)
+
         def _do_pick():
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
             Intent         = autoclass("android.content.Intent")
             intent = Intent()
             intent.setType("image/*")
             intent.setAction(Intent.ACTION_GET_CONTENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
 
             def _on_result(req_code, result_code, intent_data):
-                if req_code != 2020 or result_code != -1:
+                if req_code != 2020:
                     return
                 activity.unbind(on_activity_result=_on_result)
+                if result_code != -1:
+                    return
                 if not intent_data:
                     return
                 try:
@@ -2407,14 +2466,14 @@ def _request_image_pick(on_path):
             PythonActivity.mActivity.startActivityForResult(
                 Intent.createChooser(intent, "Выбрать фото"), 2020)
 
-        if not check_permission(Permission.READ_EXTERNAL_STORAGE):
+        if not all(check_permission(p) for p in permissions):
             def _on_perm(perms, grants):
                 if all(grants):
                     _do_pick()
                 else:
                     Clock.schedule_once(
                         lambda dt: show_msg("Ошибка", "Нет разрешения для галереи"), 0)
-            request_permissions([Permission.READ_EXTERNAL_STORAGE], _on_perm)
+            request_permissions(permissions, _on_perm)
         else:
             _do_pick()
     except Exception as e:
@@ -2425,20 +2484,25 @@ def _uri_to_path(uri):
     """Конвертирует Android URI в локальный путь через ContentResolver."""
     try:
         from jnius import autoclass
+        from jnius import cast
         app = App.get_running_app()
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         resolver = PythonActivity.mActivity.getContentResolver()
         stream   = resolver.openInputStream(uri)
+        if stream is None:
+            return None
         buf_stream = autoclass("java.io.BufferedInputStream")(stream)
         tmp_path   = os.path.join(app.user_data_dir,
                                   f"_pick_{int(time.time()*1000)}.jpg")
         fos = autoclass("java.io.FileOutputStream")(tmp_path)
-        buf = bytearray(8192)
+        ByteArray = autoclass("java.lang.reflect.Array")
+        JByte     = autoclass("java.lang.Byte").TYPE
+        jbuf      = cast("byte[]", ByteArray.newInstance(JByte, 8192))
         while True:
-            n = buf_stream.read()
+            n = buf_stream.read(jbuf)
             if n == -1:
                 break
-            fos.write(n)
+            fos.write(jbuf, 0, n)
         fos.close(); buf_stream.close(); stream.close()
         return tmp_path
     except Exception as e:
@@ -2787,7 +2851,7 @@ class ChatScreen(Screen):
                             allow_stretch=True, keep_ratio=True)
             bubble.add_widget(img)
         else:
-            bubble.add_widget(Label(text="📷 Фото", font_size="14sp",
+            bubble.add_widget(Label(text="Фото", font_size="14sp",
                                     color=t["input_fg"],
                                     size_hint=(None, None), size=(disp_w, disp_h)))
 
@@ -2864,14 +2928,9 @@ class ChatScreen(Screen):
                 if not contact or not contact.get("public_key_path"):
                     continue
                 try:
-                    payload = app.backend.encrypt_for(contact["public_key_path"], text)
-                    app.net.ws.send({
-                        "type":     "message",
-                        "to":       member,     # ← реальный пользователь, не group_id
-                        "payload":  payload,
-                        "ts":       ts,
-                        "group_id": group_id,
-                    })
+                    app.net.send_group_message(
+                        member, text, contact["public_key_path"], group_id, ts
+                    )
                 except Exception as e:
                     print(f"[Group] send to {member} error: {e}")
 
@@ -2929,7 +2988,7 @@ class ChatScreen(Screen):
             show_msg("Ошибка", "Нет ключа контакта")
             return
         sid = f"local_img_{ts}"
-        app.db.add_message(peer, "out", "📷 Фото", ts=ts, status="sent",
+        app.db.add_message(peer, "out", "Фото", ts=ts, status="sent",
                            server_id=sid, media_type="image",
                            media_path=local_path, media_thumb=thumb_b64,
                            img_w=size[0], img_h=size[1])
@@ -2949,7 +3008,7 @@ class ChatScreen(Screen):
             show_msg("Ошибка", "Группа не найдена")
             return
         sid = f"local_img_{ts}"
-        app.db.add_message(group_id, "out", "📷 Фото", ts=ts, status="sent",
+        app.db.add_message(group_id, "out", "Фото", ts=ts, status="sent",
                            server_id=sid, is_group=True, group_id=group_id,
                            media_type="image", media_path=local_path,
                            media_thumb=thumb_b64,
@@ -2997,7 +3056,7 @@ class ChatScreen(Screen):
         copy_btn.bind(on_release=_copy)
         card.add_widget(copy_btn)
 
-        del_btn = Button(text="🗑  Удалить чат", size_hint_y=None, height=dp(46),
+        del_btn = Button(text="Удалить чат", size_hint_y=None, height=dp(46),
                          background_normal="", background_color=t["danger_bg"],
                          color=[1,1,1,1])
         def _del(_):
@@ -3195,9 +3254,9 @@ def show_contact_request(from_user, pubkey_pem):
         pass
 
     row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(12))
-    acc_btn = Button(text="✓ Принять", background_normal="",
+    acc_btn = Button(text="Принять", background_normal="",
                      background_color=t["success_bg"], color=[1,1,1,1], bold=True)
-    rej_btn = Button(text="✕ Отклонить", background_normal="",
+    rej_btn = Button(text="Отклонить", background_normal="",
                      background_color=t["danger_bg"], color=[1,1,1,1])
 
     def _accept(_):
@@ -3379,6 +3438,8 @@ class SCMessApp(App):
             chat = self.root.get_screen("chat")
             chat.receive_message(peer_key, sender, text, ts, sid)
             self.root.get_screen("chats").refresh()
+            if self.root.current != "chat" or chat._peer != peer_key:
+                self._notify_new_message(sender, text)
         except Exception:
             pass
 
@@ -3387,6 +3448,8 @@ class SCMessApp(App):
             chat = self.root.get_screen("chat")
             chat.receive_image(peer, path, thumb_b64, ts, sid)
             self.root.get_screen("chats").refresh()
+            if self.root.current != "chat" or chat._peer != peer:
+                self._notify_new_message(peer, "Фото")
         except Exception:
             pass
 
@@ -3408,6 +3471,18 @@ class SCMessApp(App):
                 chat.ids.peer_status_lbl.text = status
         except Exception:
             pass
+
+    def _notify_new_message(self, sender, text):
+        title = f"SCmess: @{sender}"
+        short_text = (text[:90] + "…") if len(text) > 90 else text
+        try:
+            if platform == "android":
+                from plyer import notification
+                notification.notify(title=title, message=short_text, app_name="SCmess")
+            else:
+                show_toast(f"@{sender}: {short_text}")
+        except Exception:
+            show_toast(f"@{sender}: {short_text}")
 
 
 if __name__ == "__main__":
