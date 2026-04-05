@@ -25,6 +25,7 @@ from kivy.core.window import Window
 from kivy.core.clipboard import Clipboard
 from kivy.uix.screenmanager import ScreenManager, Screen, NoTransition, SlideTransition
 from kivy.uix.modalview import ModalView
+from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.label import Label
 from kivy.uix.button import Button
 from kivy.uix.boxlayout import BoxLayout
@@ -515,7 +516,7 @@ KV = """
                     size: self.width, self.height
             TextInput:
                 id: search_inp
-                hint_text: '🔍  Поиск...'
+                hint_text: 'Поиск...'
                 background_color: 0,0,0,0
                 foreground_color: app.theme['input_fg']
                 hint_text_color: 0.38,0.38,0.52,1
@@ -622,7 +623,7 @@ KV = """
                     pos: self.x, self.y
                     size: self.width, self.height
             Button:
-                text: '📎'
+                text: '+'
                 size_hint_x: None
                 width: dp(46)
                 background_normal: ''
@@ -1249,6 +1250,26 @@ class MessageDB:
             c.execute("DELETE FROM messages WHERE peer=?", (peer,))
             c.execute("DELETE FROM chats WHERE peer=?", (peer,))
 
+    def get_unsent_local(self):
+        """Текстовые исходящие сообщения с local_ server_id — не дошли до сервера."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM messages WHERE direction='out' "
+                "AND server_id LIKE 'local_%' "
+                "AND (media_type IS NULL OR media_type='') "
+                "AND (is_group IS NULL OR is_group=0) "
+                "ORDER BY ts ASC LIMIT 100"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_server_id(self, old_sid, new_sid, new_status="sent"):
+        """Обновляем local_ server_id на реальный после подтверждения от сервера."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE messages SET server_id=?, status=? WHERE server_id=?",
+                (new_sid, new_status, old_sid)
+            )
+
     def create_group(self, group_name, members):
         group_id = f"grp_{int(time.time()*1000)}"
         with self._conn() as c:
@@ -1363,8 +1384,8 @@ class WSClient:
                     break
                 if opcode == 8:   # close
                     break
-                if opcode == 9:   # ping — отвечаем pong
-                    self._send_raw(0x8A, frame or b"")
+                if opcode == 9:   # ping — отвечаем pong (маскированный)
+                    self._send_masked_control(0xA, frame or b"")
                     continue
                 if opcode == 10:  # pong — игнорируем
                     continue
@@ -1393,7 +1414,7 @@ class WSClient:
             if not self.connected:
                 break
             try:
-                self._send_raw(0x89, b"ping")  # WS ping
+                self._send_masked_control(0x9, b"ping")  # WS ping (маскированный)
             except Exception:
                 break
 
@@ -1408,6 +1429,15 @@ class WSClient:
         with self._lock:
             if self._sock:
                 self._sock.sendall(header + data)
+
+    def _send_masked_control(self, opcode: int, data: bytes):
+        """Контрольный фрейм (ping/pong) с маскировкой — RFC 6455 требует маску от клиента."""
+        mask = os.urandom(4)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        header = bytes([0x80 | opcode, 0x80 | len(data)]) + mask
+        with self._lock:
+            if self._sock:
+                self._sock.sendall(header + masked)
 
     def _read_frame(self):
         def recv_exact(n):
@@ -1478,8 +1508,7 @@ class WSClient:
                 try:
                     self.connect(self._last_host, self._last_port, self._last_path)
                 except Exception:
-                    if self._reconnect_enabled:
-                        self._schedule_reconnect()
+                    pass  # connect() сам вызвал _schedule_reconnect при неудаче
         threading.Thread(target=_try, daemon=True).start()
 
     def disconnect(self):
@@ -1559,6 +1588,8 @@ class NetworkManager:
                 self._on_done(True, None)
             self.ws.send({"type": "get_pending"})
             self._flush_offline_queue()
+            # Переотправляем сообщения, которые не ушли до перезапуска приложения
+            Clock.schedule_once(lambda dt: self._resend_local_queue(), 1.0)
 
         elif t == "auth_error":
             if self._on_done:
@@ -1722,6 +1753,49 @@ class NetworkManager:
         self._req_counter += 1
         return f"req_{self._req_counter}"
 
+    def _resend_local_queue(self):
+        """
+        Переотправка текстовых сообщений, которые были в очереди при перезапуске.
+        Ищет в БД исходящие с server_id='local_*' (не дошли до сервера).
+        """
+        app = App.get_running_app()
+        if not app:
+            return
+        db  = getattr(app, "db", None)
+        acc = getattr(app, "my_account", None)
+        if not db or not acc:
+            return
+
+        def _do():
+            try:
+                pending = db.get_unsent_local()
+                if not pending:
+                    return
+                log.info(f"[Net] Переотправка {len(pending)} локальных сообщений")
+                for m in pending:
+                    if not self.ws.connected:
+                        break
+                    peer = m["peer"]
+                    contact = app.backend.get_contact(peer)
+                    if not contact or not contact.get("public_key_path"):
+                        continue
+                    try:
+                        payload = app.backend.encrypt_for(
+                            contact["public_key_path"], m["text"]
+                        )
+                        self.ws.send({
+                            "type": "message",
+                            "to":   peer,
+                            "payload": payload,
+                            "ts":   m["ts"],
+                        })
+                    except Exception as e:
+                        log.exception("[Net] resend local_queue item: %s", e)
+            except Exception as e:
+                log.exception("[Net] _resend_local_queue: %s", e)
+
+        threading.Thread(target=_do, daemon=True).start()
+
 
 # ─────────────────────────────────────────────────────────────
 # ЭКРАНЫ
@@ -1746,17 +1820,24 @@ class LaunchScreen(Screen):
                 halign="center", text_size=(Window.width * 0.8, None)))
             return
         for acc in accounts:
-            row = BoxLayout(size_hint_y=None, height=dp(68), spacing=dp(10),
-                            padding=[dp(12), dp(8), dp(12), dp(8)])
-            with row.canvas.before:
-                Color(*t["btn_bg"])
-                RoundedRectangle(pos=row.pos, size=row.size, radius=[12])
-            row.bind(pos=lambda i, *_: _upd_row_bg(i), size=lambda i, *_: _upd_row_bg(i))
-            def _upd_row_bg(inst):
+            # ButtonBehavior+BoxLayout — кликабельный ряд с правильным позиционированием
+            class _TapRow(ButtonBehavior, BoxLayout):
+                pass
+
+            row = _TapRow(size_hint_y=None, height=dp(68), spacing=dp(10),
+                          padding=[dp(12), dp(8), dp(12), dp(8)])
+
+            def _upd_row_bg(inst, *_):
                 inst.canvas.before.clear()
                 with inst.canvas.before:
                     Color(*t["btn_bg"])
                     RoundedRectangle(pos=inst.pos, size=inst.size, radius=[12])
+
+            with row.canvas.before:
+                Color(*t["btn_bg"])
+                RoundedRectangle(pos=row.pos, size=row.size, radius=[12])
+            row.bind(pos=_upd_row_bg, size=_upd_row_bg)
+
             ava = make_avatar(acc["username"], dp(44), acc.get("avatar"))
             row.add_widget(ava)
             info = BoxLayout(orientation="vertical")
@@ -1770,12 +1851,8 @@ class LaunchScreen(Screen):
                                       color=t["label_muted"], halign="left",
                                       text_size=(Window.width * 0.65, None)))
             row.add_widget(info)
-
-            outer = Button(size_hint=(1, None), height=dp(68),
-                           background_normal="", background_color=[0,0,0,0])
-            outer.add_widget(row)
-            outer.bind(on_release=lambda _, a=acc: self._select_account(a))
-            box.add_widget(outer)
+            row.bind(on_release=lambda _, a=acc: self._select_account(a))
+            box.add_widget(row)
 
     def _select_account(self, account):
         app = App.get_running_app()
@@ -2439,7 +2516,7 @@ def _avatar_from_path(path, callback):
 def _request_image_pick(on_path):
     """Запрашивает выбор одного изображения из галереи Android."""
     try:
-        from android.permissions import request_permissions, Permission
+        from android.permissions import request_permissions, Permission, check_permission
         from android import activity
         from jnius import autoclass
 
@@ -3329,6 +3406,7 @@ class SCMessApp(App):
         self.net.on_contact_request  = self._on_contact_request
         self.net.on_request_accepted = self._on_request_accepted
         self.net.on_user_status      = self._on_user_status
+        self.net.on_message_status   = self._on_message_status
 
         Builder.load_string(KV)
 
@@ -3498,18 +3576,12 @@ class SCMessApp(App):
         except Exception as e:
             log.exception("user status update failed: %s", e)
 
-    def _notify_new_message(self, sender, text):
-        title = f"SCmess: @{sender}"
-        short_text = (text[:90] + "...") if len(text) > 90 else text
+    def _on_message_status(self, server_id, status):
+        """Обновляем статус исходящего сообщения (sent/delivered/read)."""
         try:
-            if platform == "android":
-                from plyer import notification
-                notification.notify(title=title, message=short_text, app_name="SCmess")
-            else:
-                show_toast(f"@{sender}: {short_text}")
-        except Exception as e:
-            log.exception("notification failed: %s", e)
-            show_toast(f"@{sender}: {short_text}")
+            self.db.update_status(server_id, status)
+        except Exception:
+            pass
 
     def _notify_new_message(self, sender, text):
         title = f"SCmess: @{sender}"
