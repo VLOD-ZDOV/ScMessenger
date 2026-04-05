@@ -5,13 +5,14 @@ SCmess — E2E-зашифрованный мессенджер
 Протокол: WebSocket JSON
 """
 
-import os, io, json, base64, threading, hashlib, time, sqlite3, re
+import os, io, json, base64, threading, hashlib, time, sqlite3, re, logging
+from collections import deque
 from datetime import datetime
 
 from kivy.config import Config
 Config.set("graphics", "maxfps", "120")
 Config.set("kivy", "allow_screensaver", "0")
-Config.set("kivy", "keyboard_mode", "")
+Config.set("kivy", "keyboard_mode", "system")
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -40,6 +41,8 @@ from kivy.properties import (
 )
 from kivy.metrics import dp
 from kivy.graphics import Color, RoundedRectangle, Rectangle, Line, Ellipse
+
+log = logging.getLogger("scmess.client")
 
 HAS_PIL = False
 try:
@@ -185,12 +188,12 @@ KV = """
             size_hint_y: None
             height: dp(16)
         StyledButton:
-            text: '＋  Создать аккаунт'
+            text: 'Создать аккаунт'
             size_hint_y: None
             height: dp(52)
             on_release: root.open_create_account()
         StyledButton:
-            text: '🔒  Настроить PIN-код'
+            text: 'Настроить PIN-код'
             size_hint_y: None
             height: dp(44)
             on_release: root.setup_pin()
@@ -267,7 +270,7 @@ KV = """
             size_hint_y: None
             height: dp(48)
             Button:
-                text: '←  Назад'
+                text: 'Назад'
                 size_hint_x: None
                 width: dp(90)
                 background_normal: ''
@@ -302,7 +305,7 @@ KV = """
                 on_release: root.select_keysize(2048)
             ToggleKeySize:
                 id: key_4096
-                text: '4096 бит ✓'
+                text: '4096 бит (рекомендовано)'
                 group: 'keysize'
                 state: 'down'
                 on_release: root.select_keysize(4096)
@@ -360,7 +363,7 @@ KV = """
             size_hint_y: None
             height: dp(48)
             Button:
-                text: '←  Назад'
+                text: 'Назад'
                 size_hint_x: None
                 width: dp(90)
                 background_normal: ''
@@ -555,7 +558,7 @@ KV = """
                     pos: self.x, self.y
                     size: self.width, self.height
             Button:
-                text: '←'
+                text: 'Назад'
                 size_hint_x: None
                 width: dp(40)
                 background_normal: ''
@@ -669,7 +672,7 @@ KV = """
             size_hint_y: None
             height: dp(48)
             Button:
-                text: '←  Назад'
+                text: 'Назад'
                 size_hint_x: None
                 width: dp(90)
                 background_normal: ''
@@ -1212,7 +1215,7 @@ class MessageDB:
                 (peer, direction, text, ts, status, server_id,
                  1 if is_group else 0, group_id, media_type, media_path,
                  media_thumb, img_w, img_h))
-            preview = "📷 Фото" if media_type == "image" else text
+            preview = "Фото" if media_type == "image" else text
             c.execute(
                 "INSERT OR REPLACE INTO chats (peer,last_msg,last_ts,unread,is_group) "
                 "VALUES (?,?,?, COALESCE((SELECT unread FROM chats WHERE peer=?),0)"
@@ -1313,6 +1316,10 @@ class WSClient:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(10)
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except Exception:
+                pass
             s.connect((host, int(port)))
             # WS Handshake
             key = base64.b64encode(os.urandom(16)).decode()
@@ -1344,6 +1351,8 @@ class WSClient:
             return True
         except Exception as e:
             self.connected = False
+            if self._reconnect_enabled and self._last_host:
+                self._schedule_reconnect()
             raise e
 
     def _recv_loop(self):
@@ -1456,6 +1465,8 @@ class WSClient:
             return True
         except Exception:
             self.connected = False
+            if self._reconnect_enabled and self._last_host:
+                self._schedule_reconnect()
             return False
 
     def _schedule_reconnect(self):
@@ -1500,6 +1511,7 @@ class NetworkManager:
         self._priv_key_path = ""
         self._pub_key_pem   = ""
         self._on_done = None
+        self._offline_queue = deque(maxlen=300)
 
         self.on_status_change    = None
         self.on_incoming_message = None
@@ -1546,6 +1558,7 @@ class NetworkManager:
             if self._on_done:
                 self._on_done(True, None)
             self.ws.send({"type": "get_pending"})
+            self._flush_offline_queue()
 
         elif t == "auth_error":
             if self._on_done:
@@ -1629,7 +1642,7 @@ class NetworkManager:
             with open(img_path, "wb") as f:
                 f.write(file_data)
             thumb_b64, sz = app.backend.make_thumb(file_data)
-            app.db.add_message(peer, "in", "📷 Фото", ts=ts, status="delivered",
+            app.db.add_message(peer, "in", "Фото", ts=ts, status="delivered",
                                server_id=sid, media_type="image",
                                media_path=img_path, media_thumb=thumb_b64,
                                img_w=sz[0], img_h=sz[1])
@@ -1644,7 +1657,7 @@ class NetworkManager:
         try:
             payload = app.backend.encrypt_for(pub_key_path, text)
             ts = int(time.time() * 1000)
-            self.ws.send({"type": "message", "to": to, "payload": payload, "ts": ts})
+            self._send_or_queue({"type": "message", "to": to, "payload": payload, "ts": ts})
             return ts
         except Exception as e:
             print(f"[WS] send error: {e}")
@@ -1655,12 +1668,41 @@ class NetworkManager:
         try:
             payload = app.backend.encrypt_file(file_data, pub_key_path)
             ts = int(time.time() * 1000)
-            self.ws.send({"type": "image_message", "to": to,
-                          "payload": payload, "ts": ts})
+            self._send_or_queue({"type": "image_message", "to": to,
+                                 "payload": payload, "ts": ts})
             return ts
         except Exception as e:
             print(f"[WS] send image error: {e}")
             return None
+
+    def send_group_message(self, to: str, text: str, pub_key_path: str, group_id: str, ts: int):
+        app = App.get_running_app()
+        try:
+            payload = app.backend.encrypt_for(pub_key_path, text)
+            self._send_or_queue({
+                "type": "message", "to": to, "payload": payload,
+                "ts": ts, "group_id": group_id,
+            })
+            return True
+        except Exception as e:
+            print(f"[WS] group send error: {e}")
+            return False
+
+    def _send_or_queue(self, msg: dict):
+        sent = self.ws.send(msg)
+        if not sent:
+            self._offline_queue.append(msg)
+        return sent
+
+    def _flush_offline_queue(self):
+        if not self.ws.connected or not self._offline_queue:
+            return
+        items = list(self._offline_queue)
+        self._offline_queue.clear()
+        for m in items:
+            if not self.ws.send(m):
+                self._offline_queue.appendleft(m)
+                break
 
     def request_contact(self, username: str):
         self.ws.send({"type": "contact_request", "to": username})
@@ -1704,24 +1746,21 @@ class LaunchScreen(Screen):
                 halign="center", text_size=(Window.width * 0.8, None)))
             return
         for acc in accounts:
-            row = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(10))
-            ava = make_avatar(acc["username"], dp(44), acc.get("avatar"))
-            row.add_widget(ava)
-            info = BoxLayout(orientation="vertical")
-            info.add_widget(Label(text=f"@{acc['username']}",
-                                  font_size="17sp", bold=True,
-                                  color=t["btn_text"], halign="left",
-                                  text_size=(Window.width * 0.65, None)))
-            st = acc.get("status", "")
-            if st:
-                info.add_widget(Label(text=st, font_size="12sp",
-                                      color=t["label_muted"], halign="left",
-                                      text_size=(Window.width * 0.65, None)))
-            row.add_widget(info)
-
-            outer = Button(size_hint_y=None, height=dp(60),
-                           background_normal="", background_color=[0,0,0,0])
-            outer.add_widget(row)
+            st = acc.get("status", "").strip()
+            title = f"@{acc['username']}"
+            text = f"{title}\n{st}" if st else title
+            outer = Button(
+                text=text,
+                size_hint=(1, None),
+                height=dp(72),
+                background_normal="",
+                background_color=t["btn_bg"],
+                color=t["btn_text"],
+                halign="left",
+                valign="middle",
+                text_size=(Window.width * 0.86, None),
+                padding=(dp(16), dp(10)),
+            )
             outer.bind(on_release=lambda _, a=acc: self._select_account(a))
             box.add_widget(outer)
 
@@ -1848,15 +1887,15 @@ class ServerScreen(Screen):
         if app.net.ws.connected:
             acc  = app.my_account
             name = f"@{acc['username']}" if acc else ""
-            lbl.text  = f"✓  Подключено {name} → {app.net.host}:{app.net.port}"
+            lbl.text  = f"Подключено {name} ({app.net.host}:{app.net.port})"
             lbl.color = app.theme["success_bg"]
         else:
-            lbl.text  = "○  Нет подключения"
+            lbl.text  = "Нет подключения"
             lbl.color = app.theme["label_muted"]
 
     def do_connect(self):
         host = self.ids.host_inp.text.strip()
-        port = self.ids.port_inp.text.strip() or "8765"
+        port_raw = self.ids.port_inp.text.strip() or "8765"
         app  = App.get_running_app()
         acc  = app.my_account
         if not acc:
@@ -1865,6 +1904,13 @@ class ServerScreen(Screen):
         if not host:
             show_msg("Ошибка", "Введите адрес сервера")
             return
+        try:
+            port = int(port_raw)
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except ValueError:
+            show_msg("Ошибка", "Порт должен быть числом 1..65535")
+            return
         self.ids.conn_status.text  = "Подключение..."
         self.ids.conn_status.color = app.theme["label_muted"]
         pub_pem = app.backend.pubkey_pem(acc["public_key_path"])
@@ -1872,7 +1918,7 @@ class ServerScreen(Screen):
         def _done(ok, err):
             self._update_status()
             if ok:
-                app.save_server_settings(host, int(port))
+                app.save_server_settings(host, port)
                 try:
                     app.root.get_screen("chats").update_net_badge()
                 except Exception:
@@ -1880,8 +1926,12 @@ class ServerScreen(Screen):
             else:
                 show_msg("Ошибка подключения", err or "Недоступен")
 
-        app.net.connect(host, int(port), acc["username"],
-                        acc["private_key_path"], pub_pem, on_done=_done)
+        try:
+            app.net.connect(host, port, acc["username"],
+                            acc["private_key_path"], pub_pem, on_done=_done)
+        except Exception as e:
+            self._update_status()
+            show_msg("Ошибка подключения", str(e))
 
     def do_disconnect(self):
         App.get_running_app().net.disconnect()
@@ -1901,7 +1951,7 @@ class ChatsScreen(Screen):
         chats = app.db.get_chats()
         if not chats:
             box.add_widget(Label(
-                text="Нет чатов.\nНажмите  ＋  чтобы начать переписку.",
+                text="Нет чатов.\nНажмите кнопку 'Новый чат', чтобы начать переписку.",
                 font_size="14sp", color=t["label_muted"],
                 size_hint_y=None, height=dp(90),
                 halign="center",
@@ -1965,7 +2015,7 @@ class ChatsScreen(Screen):
         info.add_widget(top)
 
         bot = BoxLayout(size_hint_y=None, height=dp(20))
-        preview = (last_msg[:36] + "…") if len(last_msg) > 36 else last_msg
+        preview = (last_msg[:36] + "...") if len(last_msg) > 36 else last_msg
         bot.add_widget(Label(text=preview, font_size="13sp",
                              color=t["label_muted"], halign="left",
                              text_size=(Window.width * 0.56, None)))
@@ -2137,7 +2187,7 @@ class ChatsScreen(Screen):
             conn_row = BoxLayout(size_hint_y=None, height=dp(26),
                                  padding=[dp(14), 0, dp(8), 0], spacing=dp(6))
             dot_lbl = Label(
-                text="●", font_size="10sp",
+                text="ON", font_size="10sp",
                 color=t["online_dot"] if is_conn else t["offline_dot"],
                 size_hint_x=None, width=dp(14))
             conn_lbl = Label(
@@ -2161,10 +2211,10 @@ class ChatsScreen(Screen):
             card.add_widget(sep)
 
         items = [
-            ("✏  Редактировать профиль",  lambda: (mv.dismiss(), self._edit_profile())),
-            ("🔌  Сервер",                lambda: (mv.dismiss(), setattr(self.manager, "current", "server"))),
-            ("🔑  Ключи",                 lambda: (mv.dismiss(), setattr(self.manager, "current", "keys"))),
-            ("🔄  Сменить аккаунт",       lambda: (mv.dismiss(), self._switch_account())),
+            ("Редактировать профиль",  lambda: (mv.dismiss(), self._edit_profile())),
+            ("Сервер",                lambda: (mv.dismiss(), setattr(self.manager, "current", "server"))),
+            ("Ключи",                 lambda: (mv.dismiss(), setattr(self.manager, "current", "keys"))),
+            ("Сменить аккаунт",       lambda: (mv.dismiss(), self._switch_account())),
         ]
         for label, action in items:
             btn = Button(text=label, size_hint_y=None, height=dp(46),
@@ -2304,13 +2354,13 @@ class ChatsScreen(Screen):
                 selected[uname] = False
                 row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10),
                                padding=[dp(6), dp(4), dp(6), dp(4)])
-                chk = Button(text="○", size_hint_x=None, width=dp(38),
+                chk = Button(text="[ ]", size_hint_x=None, width=dp(38),
                              background_normal="", background_color=t["btn_bg"],
                              color=t["label_muted"], font_size="18sp")
                 def _make_toggle(btn, un):
                     def toggle(_):
                         selected[un] = not selected[un]
-                        btn.text             = "●" if selected[un] else "○"
+                        btn.text             = "[x]" if selected[un] else "[ ]"
                         btn.color            = t["accent"] if selected[un] else t["label_muted"]
                         btn.background_color = (t["btn_border"] if selected[un] else t["btn_bg"])
                     return toggle
@@ -2376,21 +2426,32 @@ def _avatar_from_path(path, callback):
 def _request_image_pick(on_path):
     """Запрашивает выбор одного изображения из галереи Android."""
     try:
-        from android.permissions import request_permissions, Permission, check_permission
+        from android.permissions import request_permissions, Permission
         from android import activity
         from jnius import autoclass
 
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        BuildVersion   = autoclass("android.os.Build$VERSION")
+
+        permissions = []
+        if BuildVersion.SDK_INT >= 33:
+            permissions.append("android.permission.READ_MEDIA_IMAGES")
+        else:
+            permissions.append(Permission.READ_EXTERNAL_STORAGE)
+
         def _do_pick():
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
             Intent         = autoclass("android.content.Intent")
             intent = Intent()
             intent.setType("image/*")
             intent.setAction(Intent.ACTION_GET_CONTENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
 
             def _on_result(req_code, result_code, intent_data):
-                if req_code != 2020 or result_code != -1:
+                if req_code != 2020:
                     return
                 activity.unbind(on_activity_result=_on_result)
+                if result_code != -1:
+                    return
                 if not intent_data:
                     return
                 try:
@@ -2407,16 +2468,16 @@ def _request_image_pick(on_path):
             PythonActivity.mActivity.startActivityForResult(
                 Intent.createChooser(intent, "Выбрать фото"), 2020)
 
-        if not check_permission(Permission.READ_EXTERNAL_STORAGE):
-            def _on_perm(perms, grants):
-                if all(grants):
-                    _do_pick()
-                else:
-                    Clock.schedule_once(
-                        lambda dt: show_msg("Ошибка", "Нет разрешения для галереи"), 0)
-            request_permissions([Permission.READ_EXTERNAL_STORAGE], _on_perm)
-        else:
-            _do_pick()
+        def _on_perm(perms, grants):
+            if all(grants):
+                _do_pick()
+            else:
+                Clock.schedule_once(
+                    lambda dt: show_msg("Ошибка", "Нет разрешения для галереи"), 0)
+
+        # На Android безопаснее единообразно запрашивать разрешение,
+        # чем полагаться на check_permission для разных API уровней.
+        request_permissions(permissions, _on_perm)
     except Exception as e:
         Clock.schedule_once(lambda dt: show_msg("Ошибка", str(e)), 0)
 
@@ -2429,20 +2490,20 @@ def _uri_to_path(uri):
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         resolver = PythonActivity.mActivity.getContentResolver()
         stream   = resolver.openInputStream(uri)
-        buf_stream = autoclass("java.io.BufferedInputStream")(stream)
+        if stream is None:
+            return None
         tmp_path   = os.path.join(app.user_data_dir,
                                   f"_pick_{int(time.time()*1000)}.jpg")
-        fos = autoclass("java.io.FileOutputStream")(tmp_path)
-        buf = bytearray(8192)
-        while True:
-            n = buf_stream.read()
-            if n == -1:
-                break
-            fos.write(n)
-        fos.close(); buf_stream.close(); stream.close()
+        with open(tmp_path, "wb") as f:
+            while True:
+                b = stream.read()
+                if b == -1:
+                    break
+                f.write(bytes((b & 0xFF,)))
+        stream.close()
         return tmp_path
     except Exception as e:
-        print(f"[URI] to path error: {e}")
+        log.exception("[URI] to path error: %s", e)
         return None
 
 
@@ -2483,108 +2544,9 @@ def show_image_gallery(on_selected):
     Красивый нижний лист с последними фото из галереи.
     on_selected(path: str) — вызывается при выборе.
     """
-    app = App.get_running_app()
-    t   = app.theme
-
-    sheet_h = Window.height * 0.58
-
-    mv = ModalView(size_hint=(1, None), height=sheet_h,
-                   background_color=[0,0,0,0], auto_dismiss=True)
-    mv.pos_hint = {"x": 0, "y": 0}
-
-    root = BoxLayout(orientation="vertical")
-    # Фон
-    with root.canvas.before:
-        Color(0.07, 0.07, 0.11, 0.98)
-        RoundedRectangle(pos=root.pos, size=root.size, radius=[18, 18, 0, 0])
-    root.bind(pos=lambda i, *_: _rd(i), size=lambda i, *_: _rd(i))
-    def _rd(inst):
-        inst.canvas.before.clear()
-        with inst.canvas.before:
-            Color(0.07, 0.07, 0.11, 0.98)
-            RoundedRectangle(pos=inst.pos, size=inst.size, radius=[18, 18, 0, 0])
-
-    # Шапка листа
-    header = BoxLayout(size_hint_y=None, height=dp(48),
-                       padding=[dp(16), dp(10), dp(16), dp(8)])
-    header.add_widget(Label(text="Галерея", font_size="16sp", bold=True,
-                            color=t["title_color"], halign="left",
-                            text_size=(Window.width * 0.6, None)))
-    # Кнопка открыть полный Intent
-    full_btn = Button(text="Все файлы", background_normal="",
-                      background_color=[0,0,0,0], color=t["accent"],
-                      font_size="13sp", size_hint_x=None, width=dp(90))
-    close_btn = Button(text="✕", background_normal="",
-                       background_color=[0,0,0,0], color=t["label_muted"],
-                       font_size="18sp", size_hint_x=None, width=dp(40))
-    close_btn.bind(on_release=mv.dismiss)
-    header.add_widget(full_btn); header.add_widget(close_btn)
-    root.add_widget(header)
-
-    # Сетка с фото
-    scroll = ScrollView(do_scroll_x=False)
-    cell_size = (Window.width - dp(12)) / 3
-    grid = GridLayout(cols=3, spacing=dp(2), size_hint_y=None,
-                      padding=[dp(2), dp(2), dp(2), dp(2)])
-    grid.bind(minimum_height=grid.setter("height"))
-
-    loading_lbl = Label(text="Загрузка галереи...", font_size="14sp",
-                        color=t["label_muted"], size_hint_y=None, height=dp(60))
-    grid.add_widget(loading_lbl)
-    scroll.add_widget(grid)
-    root.add_widget(scroll)
-    mv.add_widget(root)
-    mv.open()
-
-    def _load_gallery(dt):
-        grid.clear_widgets()
-        if platform != "android":
-            grid.add_widget(Label(
-                text="Галерея доступна на Android.\nДля ПК используйте кнопку «Все файлы».",
-                font_size="13sp", color=t["label_muted"],
-                size_hint_y=None, height=dp(80), halign="center",
-                text_size=(Window.width * 0.8, None)))
-            return
-
-        paths = _query_recent_images(40)
-        if not paths:
-            grid.add_widget(Label(text="Фото не найдены", font_size="13sp",
-                                  color=t["label_muted"],
-                                  size_hint_y=None, height=dp(60)))
-            return
-
-        for path in paths:
-            cell = BoxLayout(size_hint=(None, None),
-                             size=(cell_size, cell_size))
-            try:
-                img = KivyImage(source=path,
-                               size_hint=(None, None),
-                               size=(cell_size, cell_size),
-                               allow_stretch=True, keep_ratio=False)
-            except Exception:
-                img = Label(text="?", size_hint=(None, None),
-                            size=(cell_size, cell_size))
-            cell.add_widget(img)
-
-            from kivy.uix.behaviors import ButtonBehavior
-            class ImgCell(ButtonBehavior, BoxLayout):
-                pass
-
-            btn_cell = ImgCell(size_hint=(None, None), size=(cell_size, cell_size))
-            btn_cell.add_widget(img)
-            btn_cell.bind(on_release=lambda _, p=path: _pick(p))
-            grid.add_widget(btn_cell)
-
-    def _pick(path):
-        mv.dismiss()
-        Clock.schedule_once(lambda dt: on_selected(path), 0.05)
-
-    def _full_picker(_):
-        mv.dismiss()
-        Clock.schedule_once(lambda dt: _request_image_pick(on_selected), 0.05)
-
-    full_btn.bind(on_release=_full_picker)
-    Clock.schedule_once(_load_gallery, 0.1)
+    # Упрощенный стабильный вариант: системный picker.
+    # Это убирает краши, связанные с MediaStore превью на разных Android API.
+    _request_image_pick(on_selected)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2677,7 +2639,7 @@ class ChatScreen(Screen):
         is_out = (direction == "out")
         dt     = datetime.fromtimestamp(ts / 1000)
         tstr   = dt.strftime("%H:%M")
-        icon   = {"sent": "✓", "delivered": "✓✓", "read": "✓✓"}.get(status, "")
+        icon   = {"sent": "отпр", "delivered": "дост", "read": "проч"}.get(status, "")
         bcolor = t["bubble_out"] if is_out else t["bubble_in"]
         max_w  = Window.width * 0.72
 
@@ -2730,7 +2692,7 @@ class ChatScreen(Screen):
         is_out = (direction == "out")
         dt     = datetime.fromtimestamp(ts / 1000)
         tstr   = dt.strftime("%H:%M")
-        icon   = {"sent": "✓", "delivered": "✓✓", "read": "✓✓"}.get(status, "")
+        icon   = {"sent": "отпр", "delivered": "дост", "read": "проч"}.get(status, "")
         bcolor = t["bubble_out"] if is_out else t["bubble_in"]
 
         # Вычисляем размер с сохранением пропорций
@@ -2787,7 +2749,7 @@ class ChatScreen(Screen):
                             allow_stretch=True, keep_ratio=True)
             bubble.add_widget(img)
         else:
-            bubble.add_widget(Label(text="📷 Фото", font_size="14sp",
+            bubble.add_widget(Label(text="Фото", font_size="14sp",
                                     color=t["input_fg"],
                                     size_hint=(None, None), size=(disp_w, disp_h)))
 
@@ -2864,14 +2826,9 @@ class ChatScreen(Screen):
                 if not contact or not contact.get("public_key_path"):
                     continue
                 try:
-                    payload = app.backend.encrypt_for(contact["public_key_path"], text)
-                    app.net.ws.send({
-                        "type":     "message",
-                        "to":       member,     # ← реальный пользователь, не group_id
-                        "payload":  payload,
-                        "ts":       ts,
-                        "group_id": group_id,
-                    })
+                    app.net.send_group_message(
+                        member, text, contact["public_key_path"], group_id, ts
+                    )
                 except Exception as e:
                     print(f"[Group] send to {member} error: {e}")
 
@@ -2887,10 +2844,11 @@ class ChatScreen(Screen):
             show_msg("Недоступно",
                      "Отправка фото доступна на Android.\n"
                      "На ПК можете использовать кнопку «Все файлы».")
+            return
         show_image_gallery(self._on_image_chosen)
 
     def _on_image_chosen(self, path):
-        """Путь выбранного изображения → сжать → зашифровать → отправить."""
+        """Путь выбранного изображения -> сжать -> зашифровать -> отправить."""
         if not path or not os.path.exists(path):
             return
         app  = App.get_running_app()
@@ -2929,7 +2887,7 @@ class ChatScreen(Screen):
             show_msg("Ошибка", "Нет ключа контакта")
             return
         sid = f"local_img_{ts}"
-        app.db.add_message(peer, "out", "📷 Фото", ts=ts, status="sent",
+        app.db.add_message(peer, "out", "Фото", ts=ts, status="sent",
                            server_id=sid, media_type="image",
                            media_path=local_path, media_thumb=thumb_b64,
                            img_w=size[0], img_h=size[1])
@@ -2949,7 +2907,7 @@ class ChatScreen(Screen):
             show_msg("Ошибка", "Группа не найдена")
             return
         sid = f"local_img_{ts}"
-        app.db.add_message(group_id, "out", "📷 Фото", ts=ts, status="sent",
+        app.db.add_message(group_id, "out", "Фото", ts=ts, status="sent",
                            server_id=sid, is_group=True, group_id=group_id,
                            media_type="image", media_path=local_path,
                            media_thumb=thumb_b64,
@@ -2982,7 +2940,7 @@ class ChatScreen(Screen):
         contact = app.backend.get_contact(peer)
         if contact and contact.get("public_key_path"):
             fp = app.backend.pubkey_fingerprint(contact["public_key_path"])
-            card.add_widget(Label(text=f"🔑 {fp}", font_size="11sp",
+            card.add_widget(Label(text=f"Ключ: {fp}", font_size="11sp",
                                   color=t["label_muted"], size_hint_y=None, height=dp(22),
                                   halign="left", text_size=(Window.width*0.74, None)))
         copy_btn = Button(text="Скопировать ключ контакта",
@@ -2997,7 +2955,7 @@ class ChatScreen(Screen):
         copy_btn.bind(on_release=_copy)
         card.add_widget(copy_btn)
 
-        del_btn = Button(text="🗑  Удалить чат", size_hint_y=None, height=dp(46),
+        del_btn = Button(text="Удалить чат", size_hint_y=None, height=dp(46),
                          background_normal="", background_color=t["danger_bg"],
                          color=[1,1,1,1])
         def _del(_):
@@ -3038,7 +2996,7 @@ class KeysScreen(Screen):
         lbl = self.ids.my_key_label
         if acc:
             fp = app.backend.pubkey_fingerprint(acc["public_key_path"])
-            lbl.text = f"@{acc['username']}  🔑 {fp}"
+            lbl.text = f"@{acc['username']}  Ключ: {fp}"
         else:
             lbl.text = "Аккаунт не выбран"
         self._refresh_contacts()
@@ -3062,7 +3020,7 @@ class KeysScreen(Screen):
         Clipboard.copy(json.dumps({"username": acc["username"],
                                    "public_key": pub, "private_key": priv}, indent=2))
         show_msg("Экспорт", "Ключи скопированы в буфер (JSON).\n"
-                            "⚠ Храните приватный ключ в безопасном месте!")
+                            "Важно: храните приватный ключ в безопасном месте!")
 
     def import_keys(self):
         app = App.get_running_app()
@@ -3145,11 +3103,11 @@ class KeysScreen(Screen):
             info.add_widget(Label(text=f"@{c['username']}", font_size="14sp",
                                   bold=True, color=t["btn_text"], halign="left",
                                   text_size=(Window.width*0.54, None)))
-            info.add_widget(Label(text=f"🔑 {fp}", font_size="10sp",
+            info.add_widget(Label(text=f"Ключ: {fp}", font_size="10sp",
                                   color=t["label_muted"], halign="left",
                                   text_size=(Window.width*0.54, None)))
             row.add_widget(info)
-            del_btn = Button(text="✕", size_hint_x=None, width=dp(40),
+            del_btn = Button(text="Удалить", size_hint_x=None, width=dp(72),
                              background_normal="",
                              background_color=t["danger_bg"], color=[1,1,1,1])
             del_btn.bind(on_release=lambda _, u=c:
@@ -3188,16 +3146,16 @@ def show_contact_request(from_user, pubkey_pem):
             f.write(pubkey_pem)
         fp = app.backend.pubkey_fingerprint(tmp)
         os.remove(tmp)
-        card.add_widget(Label(text=f"🔑 {fp}", font_size="10sp",
+        card.add_widget(Label(text=f"Ключ: {fp}", font_size="10sp",
                               color=t["label_muted"], size_hint_y=None, height=dp(20),
                               halign="center", text_size=(Window.width*0.78, None)))
     except Exception:
         pass
 
     row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(12))
-    acc_btn = Button(text="✓ Принять", background_normal="",
+    acc_btn = Button(text="Принять", background_normal="",
                      background_color=t["success_bg"], color=[1,1,1,1], bold=True)
-    rej_btn = Button(text="✕ Отклонить", background_normal="",
+    rej_btn = Button(text="Отклонить", background_normal="",
                      background_color=t["danger_bg"], color=[1,1,1,1])
 
     def _accept(_):
@@ -3379,6 +3337,8 @@ class SCMessApp(App):
             chat = self.root.get_screen("chat")
             chat.receive_message(peer_key, sender, text, ts, sid)
             self.root.get_screen("chats").refresh()
+            if self.root.current != "chat" or chat._peer != peer_key:
+                self._notify_new_message(sender, text)
         except Exception:
             pass
 
@@ -3387,6 +3347,8 @@ class SCMessApp(App):
             chat = self.root.get_screen("chat")
             chat.receive_image(peer, path, thumb_b64, ts, sid)
             self.root.get_screen("chats").refresh()
+            if self.root.current != "chat" or chat._peer != peer:
+                self._notify_new_message(peer, "Фото")
         except Exception:
             pass
 
@@ -3406,8 +3368,21 @@ class SCMessApp(App):
             if chat._peer == username:
                 status = "онлайн" if is_online else "был(а) в сети"
                 chat.ids.peer_status_lbl.text = status
-        except Exception:
-            pass
+        except Exception as e:
+            log.exception("user status update failed: %s", e)
+
+    def _notify_new_message(self, sender, text):
+        title = f"SCmess: @{sender}"
+        short_text = (text[:90] + "...") if len(text) > 90 else text
+        try:
+            if platform == "android":
+                from plyer import notification
+                notification.notify(title=title, message=short_text, app_name="SCmess")
+            else:
+                show_toast(f"@{sender}: {short_text}")
+        except Exception as e:
+            log.exception("notification failed: %s", e)
+            show_toast(f"@{sender}: {short_text}")
 
 
 if __name__ == "__main__":
