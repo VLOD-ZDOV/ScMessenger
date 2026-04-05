@@ -12,7 +12,7 @@ from datetime import datetime
 from kivy.config import Config
 Config.set("graphics", "maxfps", "120")
 Config.set("kivy", "allow_screensaver", "0")
-Config.set("kivy", "keyboard_mode", "")
+Config.set("kivy", "keyboard_mode", "system")
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -268,7 +268,7 @@ KV = """
             size_hint_y: None
             height: dp(48)
             Button:
-                text: '←  Назад'
+                text: 'Назад'
                 size_hint_x: None
                 width: dp(90)
                 background_normal: ''
@@ -303,7 +303,7 @@ KV = """
                 on_release: root.select_keysize(2048)
             ToggleKeySize:
                 id: key_4096
-                text: '4096 бит ✓'
+                text: '4096 бит (рекомендовано)'
                 group: 'keysize'
                 state: 'down'
                 on_release: root.select_keysize(4096)
@@ -361,7 +361,7 @@ KV = """
             size_hint_y: None
             height: dp(48)
             Button:
-                text: '←  Назад'
+                text: 'Назад'
                 size_hint_x: None
                 width: dp(90)
                 background_normal: ''
@@ -556,7 +556,7 @@ KV = """
                     pos: self.x, self.y
                     size: self.width, self.height
             Button:
-                text: '←'
+                text: 'Назад'
                 size_hint_x: None
                 width: dp(40)
                 background_normal: ''
@@ -670,7 +670,7 @@ KV = """
             size_hint_y: None
             height: dp(48)
             Button:
-                text: '←  Назад'
+                text: 'Назад'
                 size_hint_x: None
                 width: dp(90)
                 background_normal: ''
@@ -1896,7 +1896,7 @@ class ServerScreen(Screen):
         if app.net.ws.connected:
             acc  = app.my_account
             name = f"@{acc['username']}" if acc else ""
-            lbl.text  = f"✓  Подключено {name} → {app.net.host}:{app.net.port}"
+            lbl.text  = f"Подключено {name} ({app.net.host}:{app.net.port})"
             lbl.color = app.theme["success_bg"]
         else:
             lbl.text  = "Нет подключения"
@@ -1904,7 +1904,7 @@ class ServerScreen(Screen):
 
     def do_connect(self):
         host = self.ids.host_inp.text.strip()
-        port = self.ids.port_inp.text.strip() or "8765"
+        port_raw = self.ids.port_inp.text.strip() or "8765"
         app  = App.get_running_app()
         acc  = app.my_account
         if not acc:
@@ -1913,6 +1913,13 @@ class ServerScreen(Screen):
         if not host:
             show_msg("Ошибка", "Введите адрес сервера")
             return
+        try:
+            port = int(port_raw)
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except ValueError:
+            show_msg("Ошибка", "Порт должен быть числом 1..65535")
+            return
         self.ids.conn_status.text  = "Подключение..."
         self.ids.conn_status.color = app.theme["label_muted"]
         pub_pem = app.backend.pubkey_pem(acc["public_key_path"])
@@ -1920,7 +1927,7 @@ class ServerScreen(Screen):
         def _done(ok, err):
             self._update_status()
             if ok:
-                app.save_server_settings(host, int(port))
+                app.save_server_settings(host, port)
                 try:
                     app.root.get_screen("chats").update_net_badge()
                 except Exception:
@@ -1928,8 +1935,12 @@ class ServerScreen(Screen):
             else:
                 show_msg("Ошибка подключения", err or "Недоступен")
 
-        app.net.connect(host, int(port), acc["username"],
-                        acc["private_key_path"], pub_pem, on_done=_done)
+        try:
+            app.net.connect(host, port, acc["username"],
+                            acc["private_key_path"], pub_pem, on_done=_done)
+        except Exception as e:
+            self._update_status()
+            show_msg("Ошибка подключения", str(e))
 
     def do_disconnect(self):
         App.get_running_app().net.disconnect()
@@ -1949,7 +1960,7 @@ class ChatsScreen(Screen):
         chats = app.db.get_chats()
         if not chats:
             box.add_widget(Label(
-                text="Нет чатов.\nНажмите  ＋  чтобы начать переписку.",
+                text="Нет чатов.\nНажмите кнопку 'Новый чат', чтобы начать переписку.",
                 font_size="14sp", color=t["label_muted"],
                 size_hint_y=None, height=dp(90),
                 halign="center",
@@ -2013,7 +2024,7 @@ class ChatsScreen(Screen):
         info.add_widget(top)
 
         bot = BoxLayout(size_hint_y=None, height=dp(20))
-        preview = (last_msg[:36] + "…") if len(last_msg) > 36 else last_msg
+        preview = (last_msg[:36] + "...") if len(last_msg) > 36 else last_msg
         bot.add_widget(Label(text=preview, font_size="13sp",
                              color=t["label_muted"], halign="left",
                              text_size=(Window.width * 0.56, None)))
@@ -2185,7 +2196,7 @@ class ChatsScreen(Screen):
             conn_row = BoxLayout(size_hint_y=None, height=dp(26),
                                  padding=[dp(14), 0, dp(8), 0], spacing=dp(6))
             dot_lbl = Label(
-                text="●", font_size="10sp",
+                text="ON", font_size="10sp",
                 color=t["online_dot"] if is_conn else t["offline_dot"],
                 size_hint_x=None, width=dp(14))
             conn_lbl = Label(
@@ -2209,10 +2220,10 @@ class ChatsScreen(Screen):
             card.add_widget(sep)
 
         items = [
-            ("✏  Редактировать профиль",  lambda: (mv.dismiss(), self._edit_profile())),
-            ("🔌  Сервер",                lambda: (mv.dismiss(), setattr(self.manager, "current", "server"))),
-            ("🔑  Ключи",                 lambda: (mv.dismiss(), setattr(self.manager, "current", "keys"))),
-            ("🔄  Сменить аккаунт",       lambda: (mv.dismiss(), self._switch_account())),
+            ("Редактировать профиль",  lambda: (mv.dismiss(), self._edit_profile())),
+            ("Сервер",                lambda: (mv.dismiss(), setattr(self.manager, "current", "server"))),
+            ("Ключи",                 lambda: (mv.dismiss(), setattr(self.manager, "current", "keys"))),
+            ("Сменить аккаунт",       lambda: (mv.dismiss(), self._switch_account())),
         ]
         for label, action in items:
             btn = Button(text=label, size_hint_y=None, height=dp(46),
@@ -2352,13 +2363,13 @@ class ChatsScreen(Screen):
                 selected[uname] = False
                 row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10),
                                padding=[dp(6), dp(4), dp(6), dp(4)])
-                chk = Button(text="○", size_hint_x=None, width=dp(38),
+                chk = Button(text="[ ]", size_hint_x=None, width=dp(38),
                              background_normal="", background_color=t["btn_bg"],
                              color=t["label_muted"], font_size="18sp")
                 def _make_toggle(btn, un):
                     def toggle(_):
                         selected[un] = not selected[un]
-                        btn.text             = "●" if selected[un] else "○"
+                        btn.text             = "[x]" if selected[un] else "[ ]"
                         btn.color            = t["accent"] if selected[un] else t["label_muted"]
                         btn.background_color = (t["btn_border"] if selected[un] else t["btn_bg"])
                     return toggle
@@ -2547,8 +2558,12 @@ def show_image_gallery(on_selected):
     Красивый нижний лист с последними фото из галереи.
     on_selected(path: str) — вызывается при выборе.
     """
-    app = App.get_running_app()
-    t   = app.theme
+    try:
+        app = App.get_running_app()
+        t   = app.theme
+    except Exception:
+        _request_image_pick(on_selected)
+        return
 
     sheet_h = Window.height * 0.58
 
@@ -2578,7 +2593,7 @@ def show_image_gallery(on_selected):
     full_btn = Button(text="Все файлы", background_normal="",
                       background_color=[0,0,0,0], color=t["accent"],
                       font_size="13sp", size_hint_x=None, width=dp(90))
-    close_btn = Button(text="✕", background_normal="",
+    close_btn = Button(text="Закрыть", background_normal="",
                        background_color=[0,0,0,0], color=t["label_muted"],
                        font_size="18sp", size_hint_x=None, width=dp(40))
     close_btn.bind(on_release=mv.dismiss)
@@ -2601,7 +2616,11 @@ def show_image_gallery(on_selected):
     mv.open()
 
     def _load_gallery(dt):
-        grid.clear_widgets()
+        try:
+            grid.clear_widgets()
+        except Exception:
+            _request_image_pick(on_selected)
+            return
         if platform != "android":
             grid.add_widget(Label(
                 text="Галерея доступна на Android.\nДля ПК используйте кнопку «Все файлы».",
@@ -2612,9 +2631,11 @@ def show_image_gallery(on_selected):
 
         paths = _query_recent_images(40)
         if not paths:
-            grid.add_widget(Label(text="Фото не найдены", font_size="13sp",
-                                  color=t["label_muted"],
-                                  size_hint_y=None, height=dp(60)))
+            grid.add_widget(Label(
+                text="Не удалось загрузить превью.\nИспользуйте кнопку 'Все файлы'.",
+                font_size="13sp", color=t["label_muted"],
+                size_hint_y=None, height=dp(80), halign="center",
+                text_size=(Window.width * 0.85, None)))
             return
 
         for path in paths:
@@ -2741,7 +2762,7 @@ class ChatScreen(Screen):
         is_out = (direction == "out")
         dt     = datetime.fromtimestamp(ts / 1000)
         tstr   = dt.strftime("%H:%M")
-        icon   = {"sent": "✓", "delivered": "✓✓", "read": "✓✓"}.get(status, "")
+        icon   = {"sent": "отпр", "delivered": "дост", "read": "проч"}.get(status, "")
         bcolor = t["bubble_out"] if is_out else t["bubble_in"]
         max_w  = Window.width * 0.72
 
@@ -2794,7 +2815,7 @@ class ChatScreen(Screen):
         is_out = (direction == "out")
         dt     = datetime.fromtimestamp(ts / 1000)
         tstr   = dt.strftime("%H:%M")
-        icon   = {"sent": "✓", "delivered": "✓✓", "read": "✓✓"}.get(status, "")
+        icon   = {"sent": "отпр", "delivered": "дост", "read": "проч"}.get(status, "")
         bcolor = t["bubble_out"] if is_out else t["bubble_in"]
 
         # Вычисляем размер с сохранением пропорций
@@ -2946,10 +2967,11 @@ class ChatScreen(Screen):
             show_msg("Недоступно",
                      "Отправка фото доступна на Android.\n"
                      "На ПК можете использовать кнопку «Все файлы».")
+            return
         show_image_gallery(self._on_image_chosen)
 
     def _on_image_chosen(self, path):
-        """Путь выбранного изображения → сжать → зашифровать → отправить."""
+        """Путь выбранного изображения -> сжать -> зашифровать -> отправить."""
         if not path or not os.path.exists(path):
             return
         app  = App.get_running_app()
@@ -3041,7 +3063,7 @@ class ChatScreen(Screen):
         contact = app.backend.get_contact(peer)
         if contact and contact.get("public_key_path"):
             fp = app.backend.pubkey_fingerprint(contact["public_key_path"])
-            card.add_widget(Label(text=f"🔑 {fp}", font_size="11sp",
+            card.add_widget(Label(text=f"Ключ: {fp}", font_size="11sp",
                                   color=t["label_muted"], size_hint_y=None, height=dp(22),
                                   halign="left", text_size=(Window.width*0.74, None)))
         copy_btn = Button(text="Скопировать ключ контакта",
@@ -3097,7 +3119,7 @@ class KeysScreen(Screen):
         lbl = self.ids.my_key_label
         if acc:
             fp = app.backend.pubkey_fingerprint(acc["public_key_path"])
-            lbl.text = f"@{acc['username']}  🔑 {fp}"
+            lbl.text = f"@{acc['username']}  Ключ: {fp}"
         else:
             lbl.text = "Аккаунт не выбран"
         self._refresh_contacts()
@@ -3121,7 +3143,7 @@ class KeysScreen(Screen):
         Clipboard.copy(json.dumps({"username": acc["username"],
                                    "public_key": pub, "private_key": priv}, indent=2))
         show_msg("Экспорт", "Ключи скопированы в буфер (JSON).\n"
-                            "⚠ Храните приватный ключ в безопасном месте!")
+                            "Важно: храните приватный ключ в безопасном месте!")
 
     def import_keys(self):
         app = App.get_running_app()
@@ -3204,11 +3226,11 @@ class KeysScreen(Screen):
             info.add_widget(Label(text=f"@{c['username']}", font_size="14sp",
                                   bold=True, color=t["btn_text"], halign="left",
                                   text_size=(Window.width*0.54, None)))
-            info.add_widget(Label(text=f"🔑 {fp}", font_size="10sp",
+            info.add_widget(Label(text=f"Ключ: {fp}", font_size="10sp",
                                   color=t["label_muted"], halign="left",
                                   text_size=(Window.width*0.54, None)))
             row.add_widget(info)
-            del_btn = Button(text="✕", size_hint_x=None, width=dp(40),
+            del_btn = Button(text="Удалить", size_hint_x=None, width=dp(72),
                              background_normal="",
                              background_color=t["danger_bg"], color=[1,1,1,1])
             del_btn.bind(on_release=lambda _, u=c:
@@ -3247,7 +3269,7 @@ def show_contact_request(from_user, pubkey_pem):
             f.write(pubkey_pem)
         fp = app.backend.pubkey_fingerprint(tmp)
         os.remove(tmp)
-        card.add_widget(Label(text=f"🔑 {fp}", font_size="10sp",
+        card.add_widget(Label(text=f"Ключ: {fp}", font_size="10sp",
                               color=t["label_muted"], size_hint_y=None, height=dp(20),
                               halign="center", text_size=(Window.width*0.78, None)))
     except Exception:
