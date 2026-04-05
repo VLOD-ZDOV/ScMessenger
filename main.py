@@ -16,6 +16,8 @@ Config.set("kivy", "keyboard_mode", "system")
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
@@ -293,23 +295,15 @@ KV = """
             height: dp(50)
             multiline: False
         SectionLabel:
-            text: 'Размер RSA-ключа:'
-        BoxLayout:
+            text: 'Алгоритм шифрования:'
+        Label:
+            text: 'X25519 + AES-256-GCM (рекомендовано)'
+            font_size: '13sp'
+            color: app.theme['accent']
             size_hint_y: None
             height: dp(46)
-            spacing: dp(8)
-            ToggleKeySize:
-                id: key_2048
-                text: '2048 бит'
-                group: 'keysize'
-                state: 'normal'
-                on_release: root.select_keysize(2048)
-            ToggleKeySize:
-                id: key_4096
-                text: '4096 бит (рекомендовано)'
-                group: 'keysize'
-                state: 'down'
-                on_release: root.select_keysize(4096)
+            halign: 'left'
+            text_size: self.width, None
         SectionLabel:
             text: 'Ключи хранятся только у вас — сервер не может читать сообщения'
             color: app.theme['accent']
@@ -943,16 +937,19 @@ class CryptoBackend:
                 return True
         return False
 
-    def generate_key_pair(self, username, key_size=4096):
+    def generate_key_pair(self, username, key_size=None):
+        """Генерация X25519 ключевой пары (32 байта, мгновенно на ARM)."""
         ts = datetime.now().strftime("%Y%m%d%H%M%S")
-        priv_f = os.path.join(self.keys_dir, f"RSA_{username}_priv_{ts}.pem")
-        pub_f  = os.path.join(self.keys_dir, f"RSA_{username}_pub_{ts}.pem")
-        pk = rsa.generate_private_key(65537, key_size, default_backend())
+        priv_f = os.path.join(self.keys_dir, f"X25519_{username}_priv_{ts}.pem")
+        pub_f  = os.path.join(self.keys_dir, f"X25519_{username}_pub_{ts}.pem")
+        priv_key = X25519PrivateKey.generate()
+        pub_key  = priv_key.public_key()
         with open(priv_f, "wb") as f:
-            f.write(pk.private_bytes(serialization.Encoding.PEM,
-                                     serialization.PrivateFormat.PKCS8,
-                                     serialization.NoEncryption()))
-        pub_pem = pk.public_key().public_bytes(
+            f.write(priv_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption()))
+        pub_pem = pub_key.public_bytes(
             serialization.Encoding.PEM,
             serialization.PublicFormat.SubjectPublicKeyInfo)
         with open(pub_f, "wb") as f:
@@ -962,6 +959,7 @@ class CryptoBackend:
         data.insert(0, {"username": username,
                         "public_key_path": pub_f,
                         "private_key_path": priv_f,
+                        "key_type": "x25519",
                         "avatar": None,
                         "status": "Hey, I'm using SCmess!"})
         self.save_users(data)
@@ -983,32 +981,86 @@ class CryptoBackend:
 
     @staticmethod
     def _oaep():
+        """Оставлен для совместимости со старыми RSA-ключами при импорте."""
         return padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),
                             algorithm=hashes.SHA256(), label=None)
 
+    @staticmethod
+    def _ecdh_derive_key(shared_secret: bytes) -> bytes:
+        """HKDF-SHA256 из ECDH shared secret → 32-байтовый AES-ключ."""
+        return HKDF(
+            algorithm=hashes.SHA256(), length=32,
+            salt=None, info=b"scmess-v3",
+            backend=default_backend()
+        ).derive(shared_secret)
+
+    def _is_x25519_key(self, pub_key_path: str) -> bool:
+        """Определяет тип ключа по PEM-файлу."""
+        try:
+            with open(pub_key_path, "rb") as f:
+                pub = serialization.load_pem_public_key(f.read(), default_backend())
+            return isinstance(pub, X25519PublicKey)
+        except Exception:
+            return False
+
     def encrypt_for(self, pub_key_path: str, plaintext: str) -> dict:
-        aes_key = os.urandom(32)
-        iv      = os.urandom(12)
-        enc = Cipher(algorithms.AES(aes_key), modes.GCM(iv),
-                     default_backend()).encryptor()
-        ct = enc.update(plaintext.encode("utf-8")) + enc.finalize()
+        """Шифрование: X25519 ECDH + HKDF + AES-256-GCM.
+        Для старых RSA-ключей падает с понятной ошибкой."""
         with open(pub_key_path, "rb") as f:
             pub = serialization.load_pem_public_key(f.read(), default_backend())
-        enc_key = pub.encrypt(aes_key, self._oaep())
-        return {"v": 2,
-                "aes_key":    base64.b64encode(enc_key).decode(),
-                "iv":         base64.b64encode(iv).decode(),
-                "tag":        base64.b64encode(enc.tag).decode(),
-                "ciphertext": base64.b64encode(ct).decode()}
+
+        if isinstance(pub, X25519PublicKey):
+            # --- X25519 путь ---
+            eph_priv = X25519PrivateKey.generate()
+            eph_pub  = eph_priv.public_key()
+            shared   = eph_priv.exchange(pub)
+            aes_key  = self._ecdh_derive_key(shared)
+            iv = os.urandom(12)
+            enc = Cipher(algorithms.AES(aes_key), modes.GCM(iv),
+                         default_backend()).encryptor()
+            ct = enc.update(plaintext.encode("utf-8")) + enc.finalize()
+            eph_raw = eph_pub.public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+            return {"v": 3,
+                    "eph":        base64.b64encode(eph_raw).decode(),
+                    "iv":         base64.b64encode(iv).decode(),
+                    "tag":        base64.b64encode(enc.tag).decode(),
+                    "ciphertext": base64.b64encode(ct).decode()}
+        else:
+            # --- Обратная совместимость: RSA-OAEP ---
+            aes_key = os.urandom(32)
+            iv      = os.urandom(12)
+            enc = Cipher(algorithms.AES(aes_key), modes.GCM(iv),
+                         default_backend()).encryptor()
+            ct = enc.update(plaintext.encode("utf-8")) + enc.finalize()
+            enc_key = pub.encrypt(aes_key, self._oaep())
+            return {"v": 2,
+                    "aes_key":    base64.b64encode(enc_key).decode(),
+                    "iv":         base64.b64encode(iv).decode(),
+                    "tag":        base64.b64encode(enc.tag).decode(),
+                    "ciphertext": base64.b64encode(ct).decode()}
 
     def decrypt_payload(self, priv_key_path: str, payload: dict) -> str:
-        enc_key = base64.b64decode(payload["aes_key"])
-        iv      = base64.b64decode(payload["iv"])
-        tag     = base64.b64decode(payload["tag"])
-        ct      = base64.b64decode(payload["ciphertext"])
+        """Расшифровка: поддерживает v3 (X25519) и v2 (RSA) payload."""
+        version = payload.get("v", 2)
+        iv  = base64.b64decode(payload["iv"])
+        tag = base64.b64decode(payload["tag"])
+        ct  = base64.b64decode(payload["ciphertext"])
+
         with open(priv_key_path, "rb") as f:
             priv = serialization.load_pem_private_key(f.read(), None, default_backend())
-        aes_key = priv.decrypt(enc_key, self._oaep())
+
+        if version == 3:
+            # X25519 ECDH
+            eph_raw = base64.b64decode(payload["eph"])
+            eph_pub = X25519PublicKey.from_public_bytes(eph_raw)
+            shared  = priv.exchange(eph_pub)
+            aes_key = self._ecdh_derive_key(shared)
+        else:
+            # RSA-OAEP (обратная совместимость)
+            enc_key = base64.b64decode(payload["aes_key"])
+            aes_key = priv.decrypt(enc_key, self._oaep())
+
         dec = Cipher(algorithms.AES(aes_key), modes.GCM(iv, tag),
                      default_backend()).decryptor()
         return (dec.update(ct) + dec.finalize()).decode("utf-8")
@@ -1026,32 +1078,169 @@ class CryptoBackend:
         return ":".join(h[i:i+2] for i in range(0, 16, 2))
 
     def encrypt_file(self, file_data, pub_key_path):
-        aes_key = os.urandom(32); iv = os.urandom(12)
-        enc = Cipher(algorithms.AES(aes_key), modes.GCM(iv),
-                     default_backend()).encryptor()
-        ct = enc.update(file_data) + enc.finalize()
+        """Шифрование файла: X25519 ECDH + AES-256-GCM."""
         with open(pub_key_path, "rb") as f:
             pub = serialization.load_pem_public_key(f.read(), default_backend())
-        enc_key = pub.encrypt(aes_key, self._oaep())
-        return {"v": 3, "type": "file",
-                "aes_key": base64.b64encode(enc_key).decode(),
-                "iv":      base64.b64encode(iv).decode(),
-                "tag":     base64.b64encode(enc.tag).decode(),
-                "data":    base64.b64encode(ct).decode()}
+
+        if isinstance(pub, X25519PublicKey):
+            eph_priv = X25519PrivateKey.generate()
+            eph_pub  = eph_priv.public_key()
+            shared   = eph_priv.exchange(pub)
+            aes_key  = self._ecdh_derive_key(shared)
+            iv = os.urandom(12)
+            enc = Cipher(algorithms.AES(aes_key), modes.GCM(iv),
+                         default_backend()).encryptor()
+            ct = enc.update(file_data) + enc.finalize()
+            eph_raw = eph_pub.public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+            return {"v": 3, "type": "file",
+                    "eph":  base64.b64encode(eph_raw).decode(),
+                    "iv":   base64.b64encode(iv).decode(),
+                    "tag":  base64.b64encode(enc.tag).decode(),
+                    "data": base64.b64encode(ct).decode()}
+        else:
+            # RSA-OAEP обратная совместимость
+            aes_key = os.urandom(32)
+            iv = os.urandom(12)
+            enc = Cipher(algorithms.AES(aes_key), modes.GCM(iv),
+                         default_backend()).encryptor()
+            ct = enc.update(file_data) + enc.finalize()
+            enc_key = pub.encrypt(aes_key, self._oaep())
+            return {"v": 2, "type": "file",
+                    "aes_key": base64.b64encode(enc_key).decode(),
+                    "iv":      base64.b64encode(iv).decode(),
+                    "tag":     base64.b64encode(enc.tag).decode(),
+                    "data":    base64.b64encode(ct).decode()}
 
     def decrypt_file(self, payload, priv_key_path):
-        enc_key = base64.b64decode(payload["aes_key"])
-        iv      = base64.b64decode(payload["iv"])
-        tag     = base64.b64decode(payload["tag"])
-        ct      = base64.b64decode(payload["data"])
+        """Расшифровка файла: поддерживает v3 (X25519) и v2 (RSA)."""
+        version = payload.get("v", 2)
+        iv  = base64.b64decode(payload["iv"])
+        tag = base64.b64decode(payload["tag"])
+        ct  = base64.b64decode(payload["data"])
+
         with open(priv_key_path, "rb") as f:
             priv = serialization.load_pem_private_key(f.read(), None, default_backend())
-        aes_key = priv.decrypt(enc_key, self._oaep())
+
+        if version == 3:
+            eph_raw = base64.b64decode(payload["eph"])
+            eph_pub = X25519PublicKey.from_public_bytes(eph_raw)
+            shared  = priv.exchange(eph_pub)
+            aes_key = self._ecdh_derive_key(shared)
+        else:
+            enc_key = base64.b64decode(payload["aes_key"])
+            aes_key = priv.decrypt(enc_key, self._oaep())
+
         dec = Cipher(algorithms.AES(aes_key), modes.GCM(iv, tag),
                      default_backend()).decryptor()
         return dec.update(ct) + dec.finalize()
 
-    # ── Изображения ─────────────────────────────────────────
+    def encrypt_group(self, pub_paths_list: list, text: str) -> str:
+        """Групповое шифрование O(1) по тексту: один AES-ключ, N слотов.
+        Ключ сообщения шифруется X25519 ECDH для каждого участника.
+        В JSON хранятся SHA-256 fingerprint'ы публичных ключей — имена не фигурируют."""
+        aes_key = os.urandom(32)
+        iv      = os.urandom(12)
+        enc = Cipher(algorithms.AES(aes_key), modes.GCM(iv),
+                     default_backend()).encryptor()
+        ct = enc.update(text.encode()) + enc.finalize()
+        slots = {}
+        for path in pub_paths_list:
+            try:
+                with open(path, "rb") as f:
+                    pub_data = f.read()
+                pub = serialization.load_pem_public_key(pub_data, default_backend())
+                # fingerprint = SHA-256 от DER (первые 32 hex-символа)
+                der = pub.public_bytes(serialization.Encoding.DER,
+                                       serialization.PublicFormat.SubjectPublicKeyInfo)
+                fp = hashlib.sha256(der).hexdigest()[:32]
+
+                if isinstance(pub, X25519PublicKey):
+                    # X25519 ECDH: шифруем AES-ключ
+                    eph_priv = X25519PrivateKey.generate()
+                    shared   = eph_priv.exchange(pub)
+                    slot_key = self._ecdh_derive_key(shared)
+                    slot_iv  = os.urandom(12)
+                    slot_enc = Cipher(algorithms.AES(slot_key), modes.GCM(slot_iv),
+                                      default_backend()).encryptor()
+                    enc_aes = slot_enc.update(aes_key) + slot_enc.finalize()
+                    eph_raw = eph_priv.public_key().public_bytes(
+                        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+                    slots[fp] = {
+                        "v":   3,
+                        "eph": base64.b64encode(eph_raw).decode(),
+                        "iv":  base64.b64encode(slot_iv).decode(),
+                        "tag": base64.b64encode(slot_enc.tag).decode(),
+                        "k":   base64.b64encode(enc_aes).decode(),
+                    }
+                else:
+                    # RSA-OAEP обратная совместимость
+                    slots[fp] = {
+                        "v": 2,
+                        "k": base64.b64encode(pub.encrypt(aes_key, self._oaep())).decode(),
+                    }
+            except Exception:
+                log.exception("encrypt_group: failed for key %s", path)
+        return json.dumps({
+            "type":       "group_message_gcm",
+            "iv":         base64.b64encode(iv).decode(),
+            "tag":        base64.b64encode(enc.tag).decode(),
+            "ciphertext": base64.b64encode(ct).decode(),
+            "keys":       slots,
+        }, ensure_ascii=False)
+
+    def decrypt_group(self, payload_str_or_dict) -> str:
+        """Расшифровка группового сообщения: ищем наш fingerprint среди слотов."""
+        if isinstance(payload_str_or_dict, str):
+            p = json.loads(payload_str_or_dict)
+        else:
+            p = payload_str_or_dict
+        stored_keys = p.get("keys", {})
+        for user in self.load_users():
+            if not user.get("public_key_path") or not user.get("private_key_path"):
+                continue
+            try:
+                with open(user["public_key_path"], "rb") as f:
+                    pub_data = f.read()
+                pub = serialization.load_pem_public_key(pub_data, default_backend())
+                der = pub.public_bytes(serialization.Encoding.DER,
+                                       serialization.PublicFormat.SubjectPublicKeyInfo)
+                fp = hashlib.sha256(der).hexdigest()[:32]
+            except Exception:
+                log.exception("decrypt_group: fingerprint failed")
+                continue
+            if fp not in stored_keys:
+                continue
+            slot = stored_keys[fp]
+            try:
+                with open(user["private_key_path"], "rb") as f:
+                    priv = serialization.load_pem_private_key(f.read(), None, default_backend())
+                if slot.get("v", 2) == 3:
+                    # X25519
+                    eph_pub = X25519PublicKey.from_public_bytes(
+                        base64.b64decode(slot["eph"]))
+                    shared   = priv.exchange(eph_pub)
+                    slot_key = self._ecdh_derive_key(shared)
+                    slot_iv  = base64.b64decode(slot["iv"])
+                    slot_tag = base64.b64decode(slot["tag"])
+                    enc_aes  = base64.b64decode(slot["k"])
+                    dec = Cipher(algorithms.AES(slot_key),
+                                 modes.GCM(slot_iv, slot_tag),
+                                 default_backend()).decryptor()
+                    aes_key = dec.update(enc_aes) + dec.finalize()
+                else:
+                    # RSA-OAEP
+                    aes_key = priv.decrypt(base64.b64decode(slot["k"]), self._oaep())
+                iv  = base64.b64decode(p["iv"])
+                tag = base64.b64decode(p["tag"])
+                ct  = base64.b64decode(p["ciphertext"])
+                dec2 = Cipher(algorithms.AES(aes_key), modes.GCM(iv, tag),
+                              default_backend()).decryptor()
+                return (dec2.update(ct) + dec2.finalize()).decode()
+            except Exception:
+                log.exception("decrypt_group: decryption failed for fp=%s", fp)
+                continue
+        raise Exception("Это сообщение зашифровано не для вас.")
     def compress_image(self, image_path_or_data, max_dim=1280, quality=82):
         """Умное сжатие: сохраняет пропорции, качество, режет только слишком большие."""
         try:
@@ -1097,27 +1286,31 @@ class CryptoBackend:
 
     def _compress_android(self, image_path, max_dim, quality):
         try:
-            BitmapFactory = _autoclass("android.graphics.BitmapFactory")
-            ByteArrayOutputStream = _autoclass("java.io.ByteArrayOutputStream")
-            CompressFormat = _autoclass("android.graphics.Bitmap$CompressFormat")
-            opts = _autoclass("android.graphics.BitmapFactory$Options")()
+            # Импортируем здесь, а не на уровне модуля — JVM может не быть готова при старте
+            from jnius import autoclass
+            BitmapFactory  = autoclass("android.graphics.BitmapFactory")
+            ByteArrOS      = autoclass("java.io.ByteArrayOutputStream")
+            CompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
+            Opts           = autoclass("android.graphics.BitmapFactory$Options")
+
+            opts = Opts()
             opts.inJustDecodeBounds = True
             BitmapFactory.decodeFile(image_path, opts)
             w, h = opts.outWidth, opts.outHeight
             s = 1
-            while max(w // s, h // s) > max_dim:
+            while max(w // max(s, 1), h // max(s, 1)) > max_dim:
                 s *= 2
             opts.inJustDecodeBounds = False
             opts.inSampleSize = s
             bmp = BitmapFactory.decodeFile(image_path, opts)
             if not bmp:
-                raise Exception("decodeFile failed")
-            stream = ByteArrayOutputStream()
+                raise Exception("decodeFile returned null")
+            stream = ByteArrOS()
             bmp.compress(CompressFormat.JPEG, quality, stream)
             data = bytes(stream.toByteArray())
             bmp.recycle()
             stream.close()
-            return data, (opts.outWidth // s, opts.outHeight // s)
+            return data, (opts.outWidth // max(s, 1), opts.outHeight // max(s, 1))
         except Exception as e:
             print(f"[Image] Android compress error: {e}")
             with open(image_path, "rb") as f:
@@ -1334,6 +1527,15 @@ class WSClient:
         self._last_host = host
         self._last_port = port
         self._last_path = path
+        # Закрываем старый сокет если есть — иначе потечёт _recv_loop/_ping_loop
+        old_sock = self._sock
+        self._sock = None
+        self.connected = False
+        if old_sock:
+            try:
+                old_sock.close()
+            except Exception:
+                pass
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(10)
@@ -1396,9 +1598,9 @@ class WSClient:
                     if self.on_message:
                         Clock.schedule_once(lambda dt, m=msg: self.on_message(m), 0)
                 except Exception:
-                    pass
+                    log.exception("[WS] Failed to parse or dispatch frame")
         except Exception:
-            pass
+            log.exception("[WS] _recv_loop error")
         finally:
             was_conn = self.connected
             self.connected = False
@@ -1416,6 +1618,7 @@ class WSClient:
             try:
                 self._send_masked_control(0x9, b"ping")  # WS ping (маскированный)
             except Exception:
+                log.exception("[WS] _ping_loop send failed")
                 break
 
     def _send_raw(self, opcode_byte, data: bytes):
@@ -1551,14 +1754,34 @@ class NetworkManager:
         self.on_user_status      = None
 
     def connect(self, host, port, username, priv_key_path, pub_key_pem, on_done=None):
-        self.host = host
-        self.port = port
-        self._username      = username
-        self._priv_key_path = priv_key_path
-        self._pub_key_pem   = pub_key_pem
-        self._on_done       = on_done
-        self.ws._reconnect_enabled = True
+        # ── 1. Закрываем ЛЮБОЕ существующее соединение ──────
+        # Отключаем reconnect ДО закрытия сокета, иначе _recv_loop.finally
+        # поставит ещё один reconnect прямо перед нашим новым connect.
+        self.ws._reconnect_enabled = False
+        old_sock = self.ws._sock
+        self.ws._sock = None
+        self.ws.connected = False
+        if old_sock:
+            try:
+                old_sock.close()
+            except Exception:
+                pass
+
+        # ── 2. Устанавливаем параметры нового соединения ────
+        self.host            = host
+        self.port            = port
+        self._username       = username
+        self._priv_key_path  = priv_key_path
+        self._pub_key_pem    = pub_key_pem
+        self._on_done        = on_done
+        self._offline_queue.clear()   # Очередь предыдущего юзера не нужна
+
+        # ── 3. Запускаем поток подключения ──────────────────
         def _thread():
+            # Небольшая пауза: даём _recv_loop старого сокета время выйти
+            time.sleep(0.08)
+            self.ws._reconnect_enabled  = True
+            self.ws._reconnect_delay    = self.ws.RECONNECT_BASE
             try:
                 self.ws.connect(host, port)
             except Exception as e:
@@ -1609,6 +1832,11 @@ class NetworkManager:
             if self.on_request_accepted:
                 self.on_request_accepted(msg["peer"], msg["pubkey"])
 
+        elif t == "contact_rejected":
+            peer = msg.get("peer", "")
+            Clock.schedule_once(
+                lambda dt, p=peer: show_toast(f"@{p} отклонил запрос"), 0)
+
         elif t == "message_status":
             if self.on_message_status:
                 self.on_message_status(msg["server_id"], msg["status"])
@@ -1653,7 +1881,7 @@ class NetworkManager:
             if self.on_incoming_message:
                 self.on_incoming_message(peer_key, peer, text, ts, sid)
         except Exception as e:
-            print(f"[WS] decrypt error: {e}")
+            log.exception("[WS] _handle_incoming_text decrypt error: %s", e)
 
     def _handle_incoming_image(self, msg):
         app = App.get_running_app()
@@ -1681,7 +1909,7 @@ class NetworkManager:
             if self.on_incoming_image:
                 self.on_incoming_image(peer, img_path, thumb_b64, ts, sid)
         except Exception as e:
-            print(f"[WS] image decrypt error: {e}")
+            log.exception("[WS] _handle_incoming_image error: %s", e)
 
     def send_message(self, to: str, text: str, pub_key_path: str):
         app = App.get_running_app()
@@ -1691,7 +1919,7 @@ class NetworkManager:
             self._send_or_queue({"type": "message", "to": to, "payload": payload, "ts": ts})
             return ts
         except Exception as e:
-            print(f"[WS] send error: {e}")
+            log.exception("[WS] send_message error: %s", e)
             return None
 
     def send_image(self, to: str, file_data: bytes, pub_key_path: str):
@@ -1703,20 +1931,19 @@ class NetworkManager:
                                  "payload": payload, "ts": ts})
             return ts
         except Exception as e:
-            print(f"[WS] send image error: {e}")
+            log.exception("[WS] send_image error: %s", e)
             return None
 
-    def send_group_message(self, to: str, text: str, pub_key_path: str, group_id: str, ts: int):
-        app = App.get_running_app()
+    def send_group_message(self, to: str, payload: dict, group_id: str, ts: int):
+        """Отправляет уже зашифрованный групповой payload конкретному участнику."""
         try:
-            payload = app.backend.encrypt_for(pub_key_path, text)
             self._send_or_queue({
                 "type": "message", "to": to, "payload": payload,
                 "ts": ts, "group_id": group_id,
             })
             return True
         except Exception as e:
-            print(f"[WS] group send error: {e}")
+            log.exception("[WS] send_group_message error: %s", e)
             return False
 
     def _send_or_queue(self, msg: dict):
@@ -1856,13 +2083,20 @@ class LaunchScreen(Screen):
 
     def _select_account(self, account):
         app = App.get_running_app()
-        prev = app.my_account
-        if prev and prev.get("username") != account.get("username"):
-            if app.net.ws.connected:
-                app.net.disconnect()
         app.my_account = account
-        # Изолируем БД по пользователю
         app.db = MessageDB(app.user_data_dir, account["username"])
+        # Авто-подключение: всегда запускаем connect() — он сам закроет старое
+        if app._saved_host:
+            try:
+                pub_pem = app.backend.pubkey_pem(account["public_key_path"])
+                def _done(ok, err):
+                    if not ok:
+                        Clock.schedule_once(lambda dt: app._show_conn_banner(err), 0.5)
+                app.net.connect(app._saved_host, app._saved_port,
+                               account["username"], account["private_key_path"],
+                               pub_pem, on_done=_done)
+            except Exception as e:
+                Clock.schedule_once(lambda dt: app._show_conn_banner(str(e)), 0.5)
         app.root.current = "chats"
 
     def open_create_account(self):
@@ -1931,10 +2165,9 @@ class PinScreen(Screen):
 
 
 class CreateAccountScreen(Screen):
-    _keysize = 4096
 
     def select_keysize(self, size):
-        self._keysize = size
+        pass  # X25519 не требует выбора размера ключа
 
     def do_create(self):
         username = self.ids.username_inp.text.strip().lstrip("@")
@@ -1942,19 +2175,20 @@ class CreateAccountScreen(Screen):
             self.ids.status_lbl.text  = "Имя: 3-32 символа, латиница/цифры/_"
             self.ids.status_lbl.color = [1, 0.3, 0.3, 1]
             return
-        self.ids.status_lbl.text  = f"Генерируем {self._keysize}-бит ключи..."
+        self.ids.status_lbl.text  = "Генерируем ключи X25519..."
         self.ids.status_lbl.color = App.get_running_app().theme["label_muted"]
 
         def _gen():
             try:
                 app = App.get_running_app()
-                app.backend.generate_key_pair(username, self._keysize)
+                app.backend.generate_key_pair(username)
                 def _done(dt):
                     app.my_account = app.backend.get_my_account()
                     app.db = MessageDB(app.user_data_dir, username)
                     self.manager.current = "chats"
                 Clock.schedule_once(_done, 0)
             except Exception as e:
+                log.exception("generate_key_pair failed: %s", e)
                 Clock.schedule_once(
                     lambda dt: (setattr(self.ids.status_lbl, "text", f"Ошибка: {e}"),
                                 setattr(self.ids.status_lbl, "color", [1, 0.3, 0.3, 1])), 0)
@@ -2222,13 +2456,16 @@ class ChatsScreen(Screen):
 
             def _found(result):
                 if result.get("type") == "error" or "pubkey" not in result:
-                    status.text  = f"@{username} не найден"
+                    status.text  = f"@{username} не найден на сервере"
                     status.color = [1, 0.3, 0.3, 1]
                     return
+                # Сохраняем ключ контакта локально
                 app.backend.add_contact(username, result["pubkey"])
-                my_pub = app.backend.pubkey_pem(app.my_account["public_key_path"])
-                app.net.accept_contact(username, my_pub)
+                # Отправляем запрос на контакт — собеседник получит диалог
+                # с нашим ключом и сможет принять/отклонить
+                app.net.request_contact(username)
                 mv.dismiss()
+                show_toast(f"Запрос отправлен @{username}")
                 self.open_chat(username)
 
             app.net.find_user(username, _found)
@@ -2321,7 +2558,16 @@ class ChatsScreen(Screen):
         mv.open()
 
     def _switch_account(self):
-        App.get_running_app().my_account = None
+        app = App.get_running_app()
+        # Полностью отключаемся: старый юзер должен уйти оффлайн на сервере
+        app.net.ws._reconnect_enabled = False
+        old_sock = app.net.ws._sock
+        app.net.ws._sock = None
+        app.net.ws.connected = False
+        if old_sock:
+            try: old_sock.close()
+            except Exception: pass
+        app.my_account = None
         self.manager.current = "launch"
 
     def _edit_profile(self):
@@ -2573,29 +2819,37 @@ def _request_image_pick(on_path):
 
 
 def _uri_to_path(uri):
-    """Конвертирует Android URI в локальный путь через ContentResolver."""
+    """Конвертирует Android URI в локальный файл через ContentResolver."""
     try:
         from jnius import autoclass
-        from jnius import cast
         app = App.get_running_app()
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        PythonActivity  = autoclass("org.kivy.android.PythonActivity")
+        BufferedInput   = autoclass("java.io.BufferedInputStream")
+        ByteArrOS       = autoclass("java.io.ByteArrayOutputStream")
+
         resolver = PythonActivity.mActivity.getContentResolver()
         stream   = resolver.openInputStream(uri)
         if stream is None:
             return None
-        buf_stream = autoclass("java.io.BufferedInputStream")(stream)
-        tmp_path   = os.path.join(app.user_data_dir,
-                                  f"_pick_{int(time.time()*1000)}.jpg")
-        fos = autoclass("java.io.FileOutputStream")(tmp_path)
-        ByteArray = autoclass("java.lang.reflect.Array")
-        JByte     = autoclass("java.lang.Byte").TYPE
-        jbuf      = cast("byte[]", ByteArray.newInstance(JByte, 8192))
-        while True:
-            n = buf_stream.read(jbuf)
-            if n == -1:
-                break
-            fos.write(jbuf, 0, n)
-        fos.close(); buf_stream.close(); stream.close()
+
+        buf    = BufferedInput(stream)
+        output = ByteArrOS()
+        # Читаем байт за байтом через буферизованный поток
+        # (избегаем сложных JNI byte[] операций)
+        b = buf.read()
+        while b != -1:
+            output.write(b)
+            b = buf.read()
+        buf.close()
+        stream.close()
+
+        # Конвертируем Java bytes → Python bytes → пишем через Python IO
+        raw = bytes(output.toByteArray())
+        output.close()
+
+        tmp_path = os.path.join(app.user_data_dir, f"_pick_{int(time.time()*1000)}.jpg")
+        with open(tmp_path, "wb") as f:
+            f.write(raw)
         return tmp_path
     except Exception as e:
         log.exception("[URI] to path error: %s", e)
@@ -2603,24 +2857,37 @@ def _uri_to_path(uri):
 
 
 def _query_recent_images(limit=40):
-    """Возвращает список путей к последним фото в галерее Android."""
+    """Возвращает список путей к последним фото. Android 10+ возвращает URI строками."""
     try:
         from jnius import autoclass
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         MediaStore     = autoclass("android.provider.MediaStore$Images$Media")
-        activity       = PythonActivity.mActivity
-        resolver       = activity.getContentResolver()
+        BuildVersion   = autoclass("android.os.Build$VERSION")
+        activity_ctx   = PythonActivity.mActivity
+        resolver       = activity_ctx.getContentResolver()
+
+        # Запрашиваем только _id и _display_name для совместимости с API 29+
         cursor = resolver.query(
             MediaStore.EXTERNAL_CONTENT_URI,
             None, None, None,
             "date_added DESC")
         paths = []
         if cursor and cursor.moveToFirst():
-            idx = cursor.getColumnIndex("_data")
+            # На Android < 10 есть _data (физический путь)
+            data_idx = cursor.getColumnIndex("_data")
+            id_idx   = cursor.getColumnIndex("_id")
             while len(paths) < limit:
-                path = cursor.getString(idx)
+                path = None
+                if data_idx >= 0:
+                    path = cursor.getString(data_idx)
                 if path and os.path.exists(path):
                     paths.append(path)
+                elif id_idx >= 0 and BuildVersion.SDK_INT >= 29:
+                    # Android 10+: строим content:// URI
+                    img_id = cursor.getLong(id_idx)
+                    Uri    = autoclass("android.net.Uri")
+                    uri_str = f"content://media/external/images/media/{img_id}"
+                    paths.append(uri_str)   # Сохраняем URI строкой — обработка в _load_gallery
                 if not cursor.moveToNext():
                     break
             cursor.close()
@@ -3007,8 +3274,8 @@ class ChatScreen(Screen):
 
     def _send_group_message(self, group_id, text, ts, sid):
         """
-        Групповое сообщение: шифруем для каждого участника отдельно
-        и отправляем как обычное message с пометкой group_id.
+        Групповое сообщение: один AES-ключ, N зашифрованных слотов (O(1) по тексту).
+        Один и тот же payload рассылается всем участникам.
         """
         app   = App.get_running_app()
         group = app.db.get_group(group_id)
@@ -3025,16 +3292,24 @@ class ChatScreen(Screen):
             return
 
         def _send():
+            # Собираем пути публичных ключей всех участников
+            pub_paths = []
+            member_list = []
             for member in group["members"]:
                 contact = app.backend.get_contact(member)
-                if not contact or not contact.get("public_key_path"):
-                    continue
-                try:
-                    app.net.send_group_message(
-                        member, text, contact["public_key_path"], group_id, ts
-                    )
-                except Exception as e:
-                    print(f"[Group] send to {member} error: {e}")
+                if contact and contact.get("public_key_path"):
+                    pub_paths.append(contact["public_key_path"])
+                    member_list.append(member)
+            if not pub_paths:
+                return
+            try:
+                # Шифруем текст ОДИН РАЗ для всех участников сразу
+                payload = json.loads(app.backend.encrypt_group(pub_paths, text))
+                # Рассылаем один и тот же зашифрованный блоб каждому
+                for member in member_list:
+                    app.net.send_group_message(member, payload, group_id, ts)
+            except Exception:
+                log.exception("[Group] _send_group_message failed")
 
         threading.Thread(target=_send, daemon=True).start()
 
@@ -3128,8 +3403,8 @@ class ChatScreen(Screen):
                     continue
                 try:
                     app.net.send_image(member, compressed, contact["public_key_path"])
-                except Exception as e:
-                    print(f"[Group img] {member}: {e}")
+                except Exception:
+                    log.exception("[Group img] send to %s failed", member)
         threading.Thread(target=_send, daemon=True).start()
 
     def open_chat_menu(self):
@@ -3422,7 +3697,6 @@ class SCMessApp(App):
 
     def on_start(self):
         Window.clearcolor = tuple(self.theme["bg_color"])
-        # Поднимаем контент над клавиатурой (работает на Android)
         if platform == "android":
             Window.softinput_mode = "below_target"
 
@@ -3431,23 +3705,29 @@ class SCMessApp(App):
         else:
             self.root.current = "launch"
 
-        # Авто-подключение
-        acc = self.backend.get_my_account()
-        if acc and self._saved_host:
+        # Авто-подключение — отдельный метод, чтобы не крашить весь on_start
+        Clock.schedule_once(lambda dt: self._auto_connect(), 0.3)
+
+    def _auto_connect(self):
+        """Автоматически подключается при старте если есть сохранённый аккаунт и сервер."""
+        try:
+            acc = self.backend.get_my_account()
+            if not acc or not self._saved_host:
+                return
             self.my_account = acc
             self.db = MessageDB(self.user_data_dir, acc["username"])
             pub_pem = self.backend.pubkey_pem(acc["public_key_path"])
 
             def _done(ok, err):
                 if not ok:
-                    Clock.schedule_once(lambda dt: self._show_conn_banner(err), 0.5)
+                    Clock.schedule_once(lambda dt: self._show_conn_banner(err), 0.3)
 
-            try:
-                self.net.connect(self._saved_host, self._saved_port,
-                                 acc["username"], acc["private_key_path"],
-                                 pub_pem, on_done=_done)
-            except Exception as e:
-                Clock.schedule_once(lambda dt: self._show_conn_banner(str(e)), 1)
+            self.net.connect(self._saved_host, self._saved_port,
+                             acc["username"], acc["private_key_path"],
+                             pub_pem, on_done=_done)
+        except Exception as e:
+            log.exception("_auto_connect error: %s", e)
+            Clock.schedule_once(lambda dt: self._show_conn_banner(str(e)), 0.5)
 
     def _show_conn_banner(self, error):
         """Не-блокирующий баннер об ошибке подключения (без вылета)."""
@@ -3535,7 +3815,7 @@ class SCMessApp(App):
             self.root.get_screen("chats").update_net_badge()
             self.root.get_screen("server")._update_status()
         except Exception:
-            pass
+            log.exception("_on_net_status failed")
 
     def _on_incoming(self, peer_key, sender, text, ts, sid):
         try:
@@ -3545,7 +3825,7 @@ class SCMessApp(App):
             if self.root.current != "chat" or chat._peer != peer_key:
                 self._notify_new_message(sender, text)
         except Exception:
-            pass
+            log.exception("_on_incoming failed")
 
     def _on_incoming_image(self, peer, path, thumb_b64, ts, sid):
         try:
@@ -3555,7 +3835,7 @@ class SCMessApp(App):
             if self.root.current != "chat" or chat._peer != peer:
                 self._notify_new_message(peer, "Фото")
         except Exception:
-            pass
+            log.exception("_on_incoming_image failed")
 
     def _on_contact_request(self, from_user, pubkey_pem):
         Clock.schedule_once(
@@ -3581,7 +3861,7 @@ class SCMessApp(App):
         try:
             self.db.update_status(server_id, status)
         except Exception:
-            pass
+            log.exception("_on_message_status failed")
 
     def _notify_new_message(self, sender, text):
         title = f"SCmess: @{sender}"
