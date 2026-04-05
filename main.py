@@ -1,7 +1,7 @@
 """
 SCmess — E2E-зашифрованный мессенджер
 Клиент: Kivy + Python
-Крипто: RSA-4096 + AES-256-GCM
+Крипто: X25519 + AES-256-GCM
 Протокол: WebSocket JSON
 """
 
@@ -10,7 +10,7 @@ from collections import deque
 from datetime import datetime
 
 from kivy.config import Config
-Config.set("graphics", "maxfps", "120")
+Config.set("graphics", "maxfps", "60")
 Config.set("kivy", "allow_screensaver", "0")
 Config.set("kivy", "keyboard_mode", "system")
 
@@ -46,6 +46,10 @@ from kivy.metrics import dp
 from kivy.graphics import Color, RoundedRectangle, Rectangle, Line, Ellipse
 
 log = logging.getLogger("scmess.client")
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 HAS_PIL = False
 try:
@@ -1277,7 +1281,7 @@ class CryptoBackend:
                 # Android без PIL
                 return self._compress_android(image_path_or_data, max_dim, quality)
         except Exception as e:
-            print(f"[Image] compress error: {e}")
+            log.exception("[Image] compress error: %s", e)
             if isinstance(image_path_or_data, str):
                 with open(image_path_or_data, "rb") as f:
                     data = f.read()
@@ -1285,36 +1289,78 @@ class CryptoBackend:
             return image_path_or_data, (0, 0)
 
     def _compress_android(self, image_path, max_dim, quality):
+        """Сжатие через Android Bitmap API.
+        image_path может быть либо обычным путём /data/..., либо content:// URI-строкой
+        (в этом случае читаем через ContentResolver)."""
         try:
-            # Импортируем здесь, а не на уровне модуля — JVM может не быть готова при старте
             from jnius import autoclass
             BitmapFactory  = autoclass("android.graphics.BitmapFactory")
             ByteArrOS      = autoclass("java.io.ByteArrayOutputStream")
             CompressFormat = autoclass("android.graphics.Bitmap$CompressFormat")
             Opts           = autoclass("android.graphics.BitmapFactory$Options")
 
-            opts = Opts()
-            opts.inJustDecodeBounds = True
-            BitmapFactory.decodeFile(image_path, opts)
-            w, h = opts.outWidth, opts.outHeight
-            s = 1
-            while max(w // max(s, 1), h // max(s, 1)) > max_dim:
-                s *= 2
-            opts.inJustDecodeBounds = False
-            opts.inSampleSize = s
-            bmp = BitmapFactory.decodeFile(image_path, opts)
+            # Определяем откуда читать bitmap
+            is_uri = isinstance(image_path, str) and image_path.startswith("content://")
+
+            if is_uri:
+                # URI → InputStream → BitmapFactory.decodeStream
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                Uri = autoclass("android.net.Uri")
+                resolver = PythonActivity.mActivity.getContentResolver()
+                uri_obj  = Uri.parse(image_path)
+
+                # Сначала получаем размеры
+                opts = Opts()
+                opts.inJustDecodeBounds = True
+                stream = resolver.openInputStream(uri_obj)
+                BitmapFactory.decodeStream(stream, None, opts)
+                stream.close()
+
+                w, h = opts.outWidth, opts.outHeight
+                s = 1
+                while max(w // max(s, 1), h // max(s, 1)) > max_dim:
+                    s *= 2
+
+                # Теперь декодируем с нужным sampleSize
+                opts.inJustDecodeBounds = False
+                opts.inSampleSize = s
+                stream2 = resolver.openInputStream(uri_obj)
+                bmp = BitmapFactory.decodeStream(stream2, None, opts)
+                stream2.close()
+            else:
+                # Обычный путь к файлу
+                opts = Opts()
+                opts.inJustDecodeBounds = True
+                BitmapFactory.decodeFile(image_path, opts)
+                w, h = opts.outWidth, opts.outHeight
+                s = 1
+                while max(w // max(s, 1), h // max(s, 1)) > max_dim:
+                    s *= 2
+                opts.inJustDecodeBounds = False
+                opts.inSampleSize = s
+                bmp = BitmapFactory.decodeFile(image_path, opts)
+
             if not bmp:
-                raise Exception("decodeFile returned null")
-            stream = ByteArrOS()
-            bmp.compress(CompressFormat.JPEG, quality, stream)
-            data = bytes(stream.toByteArray())
+                raise Exception("BitmapFactory вернул null — повреждённый файл?")
+
+            stream_out = ByteArrOS()
+            bmp.compress(CompressFormat.JPEG, quality, stream_out)
+            data = bytes(stream_out.toByteArray())
+            out_w = bmp.getWidth()
+            out_h = bmp.getHeight()
             bmp.recycle()
-            stream.close()
-            return data, (opts.outWidth // max(s, 1), opts.outHeight // max(s, 1))
+            stream_out.close()
+            return data, (out_w, out_h)
         except Exception as e:
-            print(f"[Image] Android compress error: {e}")
-            with open(image_path, "rb") as f:
-                return f.read(), (0, 0)
+            log.exception("[Image] Android compress error: %s", e)
+            # Fallback: читаем сырые байты если это обычный файл
+            if isinstance(image_path, str) and not image_path.startswith("content://"):
+                try:
+                    with open(image_path, "rb") as f:
+                        return f.read(), (0, 0)
+                except Exception:
+                    pass
+            return b"", (0, 0)
 
     def make_thumb(self, data_or_path, size=240):
         """Thumbnail в base64 для превью в чате."""
@@ -1335,7 +1381,7 @@ class CryptoBackend:
                 img.save(out, format="JPEG", quality=72, optimize=True)
                 return base64.b64encode(out.getvalue()).decode(), img.size
         except Exception as e:
-            print(f"[Image] thumb error: {e}")
+            log.exception("[Image] thumb error: %s", e)
         return None, (0, 0)
 
 
@@ -1358,6 +1404,9 @@ class MessageDB:
 
     def _init(self):
         with self._conn() as c:
+            # WAL mode: убирает блокировки при одновременном чтении/записи
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
             c.execute("""CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 peer TEXT NOT NULL,
@@ -2776,28 +2825,40 @@ def _request_image_pick(on_path):
             permissions.append(Permission.READ_EXTERNAL_STORAGE)
 
         def _do_pick():
-            Intent         = autoclass("android.content.Intent")
-            intent = Intent()
+            Intent = autoclass("android.content.Intent")
+            intent = Intent(Intent.ACTION_GET_CONTENT)
             intent.setType("image/*")
-            intent.setAction(Intent.ACTION_GET_CONTENT)
             intent.addCategory(Intent.CATEGORY_OPENABLE)
+            # FLAG_GRANT_READ_URI_PERMISSION — без него Google Play Protect
+            # считает что приложение пытается обойти permission model
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
 
             def _on_result(req_code, result_code, intent_data):
                 if req_code != 2020:
                     return
                 activity.unbind(on_activity_result=_on_result)
-                if result_code != -1:
-                    return
-                if not intent_data:
+                if result_code != -1 or not intent_data:
                     return
                 try:
-                    uri   = intent_data.getData()
+                    uri = intent_data.getData()
                     if not uri:
                         return
-                    path  = _uri_to_path(uri)
+                    # Выдаём постоянное разрешение на URI чтобы не получить
+                    # SecurityException при последующем чтении
+                    try:
+                        PythonActivity.mActivity.grantUriPermission(
+                            PythonActivity.mActivity.getPackageName(),
+                            uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    except Exception:
+                        pass
+                    path = _uri_to_path(uri)
                     if path:
                         Clock.schedule_once(lambda dt: on_path(path), 0)
+                    else:
+                        Clock.schedule_once(
+                            lambda dt: show_msg("Ошибка", "Не удалось прочитать файл"), 0)
                 except Exception as e:
+                    log.exception("[Pick] _on_result error: %s", e)
                     Clock.schedule_once(lambda dt: show_msg("Ошибка", str(e)), 0)
 
             activity.bind(on_activity_result=_on_result)
@@ -2815,41 +2876,49 @@ def _request_image_pick(on_path):
         else:
             _do_pick()
     except Exception as e:
+        log.exception("[Pick] _request_image_pick error: %s", e)
         Clock.schedule_once(lambda dt: show_msg("Ошибка", str(e)), 0)
 
 
 def _uri_to_path(uri):
-    """Конвертирует Android URI в локальный файл через ContentResolver."""
+    """Конвертирует Android URI в локальный файл через ContentResolver.
+    Читает чанками через Java byte[] — НЕ байт-за-байтом (было O(n²) и OOM)."""
     try:
         from jnius import autoclass
         app = App.get_running_app()
-        PythonActivity  = autoclass("org.kivy.android.PythonActivity")
-        BufferedInput   = autoclass("java.io.BufferedInputStream")
-        ByteArrOS       = autoclass("java.io.ByteArrayOutputStream")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        ByteArrOS      = autoclass("java.io.ByteArrayOutputStream")
 
         resolver = PythonActivity.mActivity.getContentResolver()
         stream   = resolver.openInputStream(uri)
         if stream is None:
+            log.error("[URI] openInputStream returned None for %s", uri)
             return None
 
-        buf    = BufferedInput(stream)
         output = ByteArrOS()
-        # Читаем байт за байтом через буферизованный поток
-        # (избегаем сложных JNI byte[] операций)
-        b = buf.read()
-        while b != -1:
-            output.write(b)
-            b = buf.read()
-        buf.close()
+        # Читаем чанками по 64 КБ через Java byte[] — это быстро и не падает на больших файлах
+        buf_size = 65536
+        JavaByteArray = autoclass("java.lang.reflect.Array")
+        jbyte = autoclass("java.lang.Byte").TYPE
+        buf = JavaByteArray.newInstance(jbyte, buf_size)
+        while True:
+            n = stream.read(buf, 0, buf_size)
+            if n == -1:
+                break
+            output.write(buf, 0, n)
         stream.close()
 
-        # Конвертируем Java bytes → Python bytes → пишем через Python IO
         raw = bytes(output.toByteArray())
         output.close()
+
+        if not raw:
+            log.error("[URI] empty data read from %s", uri)
+            return None
 
         tmp_path = os.path.join(app.user_data_dir, f"_pick_{int(time.time()*1000)}.jpg")
         with open(tmp_path, "wb") as f:
             f.write(raw)
+        log.info("[URI] saved %d bytes to %s", len(raw), tmp_path)
         return tmp_path
     except Exception as e:
         log.exception("[URI] to path error: %s", e)
@@ -2893,7 +2962,7 @@ def _query_recent_images(limit=40):
             cursor.close()
         return paths
     except Exception as e:
-        print(f"[Gallery] query error: {e}")
+        log.exception("[Gallery] query error: %s", e)
         return []
 
 
@@ -2987,24 +3056,20 @@ def show_image_gallery(on_selected):
             return
 
         for path in paths:
-            cell = BoxLayout(size_hint=(None, None),
-                             size=(cell_size, cell_size))
-            try:
-                img = KivyImage(source=path,
-                               size_hint=(None, None),
-                               size=(cell_size, cell_size),
-                               allow_stretch=True, keep_ratio=False)
-            except Exception:
-                img = Label(text="?", size_hint=(None, None),
-                            size=(cell_size, cell_size))
-            cell.add_widget(img)
-
             from kivy.uix.behaviors import ButtonBehavior
             class ImgCell(ButtonBehavior, BoxLayout):
                 pass
 
             btn_cell = ImgCell(size_hint=(None, None), size=(cell_size, cell_size))
-            btn_cell.add_widget(img)
+            try:
+                img = KivyImage(source=path,
+                               size_hint=(None, None),
+                               size=(cell_size, cell_size),
+                               allow_stretch=True, keep_ratio=False)
+                btn_cell.add_widget(img)
+            except Exception:
+                btn_cell.add_widget(Label(text="?", size_hint=(None, None),
+                                         size=(cell_size, cell_size)))
             btn_cell.bind(on_release=lambda _, p=path: _pick(p))
             grid.add_widget(btn_cell)
 
