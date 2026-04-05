@@ -85,7 +85,7 @@ async def send_to(username: str, msg: dict) -> bool:
             await ws.send(json.dumps(msg, ensure_ascii=False))
             return True
         except Exception:
-            pass
+            log.exception("send_to @%s failed", username)
     return False
 
 
@@ -345,7 +345,7 @@ async def _deliver_pending(username: str, websocket):
             with db_conn() as c:
                 c.execute("UPDATE messages SET delivered=1 WHERE id=?", (row["id"],))
         except Exception as e:
-            log.error(f"Ошибка доставки pending: {e}")
+            log.exception("_deliver_pending: failed to deliver msg id=%s: %s", row["id"], e)
 
 
 async def _notify_contacts_online(username: str, is_online: bool):
@@ -360,8 +360,8 @@ async def _notify_contacts_online(username: str, is_online: bool):
         if uname != username:
             try:
                 await ws.send(status_msg)
-            except:
-                pass
+            except Exception:
+                log.debug("notify_contacts_online: send to @%s failed", uname)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -389,4 +389,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         log.info("Сервер остановлен")
-
