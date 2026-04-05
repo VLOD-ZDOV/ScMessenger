@@ -1746,21 +1746,34 @@ class LaunchScreen(Screen):
                 halign="center", text_size=(Window.width * 0.8, None)))
             return
         for acc in accounts:
-            st = acc.get("status", "").strip()
-            title = f"@{acc['username']}"
-            text = f"{title}\n{st}" if st else title
-            outer = Button(
-                text=text,
-                size_hint=(1, None),
-                height=dp(72),
-                background_normal="",
-                background_color=t["btn_bg"],
-                color=t["btn_text"],
-                halign="left",
-                valign="middle",
-                text_size=(Window.width * 0.86, None),
-                padding=(dp(16), dp(10)),
-            )
+            row = BoxLayout(size_hint_y=None, height=dp(68), spacing=dp(10),
+                            padding=[dp(12), dp(8), dp(12), dp(8)])
+            with row.canvas.before:
+                Color(*t["btn_bg"])
+                RoundedRectangle(pos=row.pos, size=row.size, radius=[12])
+            row.bind(pos=lambda i, *_: _upd_row_bg(i), size=lambda i, *_: _upd_row_bg(i))
+            def _upd_row_bg(inst):
+                inst.canvas.before.clear()
+                with inst.canvas.before:
+                    Color(*t["btn_bg"])
+                    RoundedRectangle(pos=inst.pos, size=inst.size, radius=[12])
+            ava = make_avatar(acc["username"], dp(44), acc.get("avatar"))
+            row.add_widget(ava)
+            info = BoxLayout(orientation="vertical")
+            info.add_widget(Label(text=f"@{acc['username']}",
+                                  font_size="17sp", bold=True,
+                                  color=t["btn_text"], halign="left",
+                                  text_size=(Window.width * 0.65, None)))
+            st = acc.get("status", "")
+            if st:
+                info.add_widget(Label(text=st, font_size="12sp",
+                                      color=t["label_muted"], halign="left",
+                                      text_size=(Window.width * 0.65, None)))
+            row.add_widget(info)
+
+            outer = Button(size_hint=(1, None), height=dp(68),
+                           background_normal="", background_color=[0,0,0,0])
+            outer.add_widget(row)
             outer.bind(on_release=lambda _, a=acc: self._select_account(a))
             box.add_widget(outer)
 
@@ -2468,16 +2481,16 @@ def _request_image_pick(on_path):
             PythonActivity.mActivity.startActivityForResult(
                 Intent.createChooser(intent, "Выбрать фото"), 2020)
 
-        def _on_perm(perms, grants):
-            if all(grants):
-                _do_pick()
-            else:
-                Clock.schedule_once(
-                    lambda dt: show_msg("Ошибка", "Нет разрешения для галереи"), 0)
-
-        # На Android безопаснее единообразно запрашивать разрешение,
-        # чем полагаться на check_permission для разных API уровней.
-        request_permissions(permissions, _on_perm)
+        if not all(check_permission(p) for p in permissions):
+            def _on_perm(perms, grants):
+                if all(grants):
+                    _do_pick()
+                else:
+                    Clock.schedule_once(
+                        lambda dt: show_msg("Ошибка", "Нет разрешения для галереи"), 0)
+            request_permissions(permissions, _on_perm)
+        else:
+            _do_pick()
     except Exception as e:
         Clock.schedule_once(lambda dt: show_msg("Ошибка", str(e)), 0)
 
@@ -2486,21 +2499,26 @@ def _uri_to_path(uri):
     """Конвертирует Android URI в локальный путь через ContentResolver."""
     try:
         from jnius import autoclass
+        from jnius import cast
         app = App.get_running_app()
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         resolver = PythonActivity.mActivity.getContentResolver()
         stream   = resolver.openInputStream(uri)
         if stream is None:
             return None
+        buf_stream = autoclass("java.io.BufferedInputStream")(stream)
         tmp_path   = os.path.join(app.user_data_dir,
                                   f"_pick_{int(time.time()*1000)}.jpg")
-        with open(tmp_path, "wb") as f:
-            while True:
-                b = stream.read()
-                if b == -1:
-                    break
-                f.write(bytes((b & 0xFF,)))
-        stream.close()
+        fos = autoclass("java.io.FileOutputStream")(tmp_path)
+        ByteArray = autoclass("java.lang.reflect.Array")
+        JByte     = autoclass("java.lang.Byte").TYPE
+        jbuf      = cast("byte[]", ByteArray.newInstance(JByte, 8192))
+        while True:
+            n = buf_stream.read(jbuf)
+            if n == -1:
+                break
+            fos.write(jbuf, 0, n)
+        fos.close(); buf_stream.close(); stream.close()
         return tmp_path
     except Exception as e:
         log.exception("[URI] to path error: %s", e)
@@ -2544,9 +2562,118 @@ def show_image_gallery(on_selected):
     Красивый нижний лист с последними фото из галереи.
     on_selected(path: str) — вызывается при выборе.
     """
-    # Упрощенный стабильный вариант: системный picker.
-    # Это убирает краши, связанные с MediaStore превью на разных Android API.
-    _request_image_pick(on_selected)
+    try:
+        app = App.get_running_app()
+        t   = app.theme
+    except Exception:
+        _request_image_pick(on_selected)
+        return
+
+    sheet_h = Window.height * 0.58
+
+    mv = ModalView(size_hint=(1, None), height=sheet_h,
+                   background_color=[0,0,0,0], auto_dismiss=True)
+    mv.pos_hint = {"x": 0, "y": 0}
+
+    root = BoxLayout(orientation="vertical")
+    # Фон
+    with root.canvas.before:
+        Color(0.07, 0.07, 0.11, 0.98)
+        RoundedRectangle(pos=root.pos, size=root.size, radius=[18, 18, 0, 0])
+    root.bind(pos=lambda i, *_: _rd(i), size=lambda i, *_: _rd(i))
+    def _rd(inst):
+        inst.canvas.before.clear()
+        with inst.canvas.before:
+            Color(0.07, 0.07, 0.11, 0.98)
+            RoundedRectangle(pos=inst.pos, size=inst.size, radius=[18, 18, 0, 0])
+
+    # Шапка листа
+    header = BoxLayout(size_hint_y=None, height=dp(48),
+                       padding=[dp(16), dp(10), dp(16), dp(8)])
+    header.add_widget(Label(text="Галерея", font_size="16sp", bold=True,
+                            color=t["title_color"], halign="left",
+                            text_size=(Window.width * 0.6, None)))
+    # Кнопка открыть полный Intent
+    full_btn = Button(text="Все файлы", background_normal="",
+                      background_color=[0,0,0,0], color=t["accent"],
+                      font_size="13sp", size_hint_x=None, width=dp(90))
+    close_btn = Button(text="Закрыть", background_normal="",
+                       background_color=[0,0,0,0], color=t["label_muted"],
+                       font_size="18sp", size_hint_x=None, width=dp(40))
+    close_btn.bind(on_release=mv.dismiss)
+    header.add_widget(full_btn); header.add_widget(close_btn)
+    root.add_widget(header)
+
+    # Сетка с фото
+    scroll = ScrollView(do_scroll_x=False)
+    cell_size = (Window.width - dp(12)) / 3
+    grid = GridLayout(cols=3, spacing=dp(2), size_hint_y=None,
+                      padding=[dp(2), dp(2), dp(2), dp(2)])
+    grid.bind(minimum_height=grid.setter("height"))
+
+    loading_lbl = Label(text="Загрузка галереи...", font_size="14sp",
+                        color=t["label_muted"], size_hint_y=None, height=dp(60))
+    grid.add_widget(loading_lbl)
+    scroll.add_widget(grid)
+    root.add_widget(scroll)
+    mv.add_widget(root)
+    mv.open()
+
+    def _load_gallery(dt):
+        try:
+            grid.clear_widgets()
+        except Exception:
+            _request_image_pick(on_selected)
+            return
+        if platform != "android":
+            grid.add_widget(Label(
+                text="Галерея доступна на Android.\nДля ПК используйте кнопку «Все файлы».",
+                font_size="13sp", color=t["label_muted"],
+                size_hint_y=None, height=dp(80), halign="center",
+                text_size=(Window.width * 0.8, None)))
+            return
+
+        paths = _query_recent_images(40)
+        if not paths:
+            grid.add_widget(Label(
+                text="Не удалось загрузить превью.\nИспользуйте кнопку 'Все файлы'.",
+                font_size="13sp", color=t["label_muted"],
+                size_hint_y=None, height=dp(80), halign="center",
+                text_size=(Window.width * 0.85, None)))
+            return
+
+        for path in paths:
+            cell = BoxLayout(size_hint=(None, None),
+                             size=(cell_size, cell_size))
+            try:
+                img = KivyImage(source=path,
+                               size_hint=(None, None),
+                               size=(cell_size, cell_size),
+                               allow_stretch=True, keep_ratio=False)
+            except Exception:
+                img = Label(text="?", size_hint=(None, None),
+                            size=(cell_size, cell_size))
+            cell.add_widget(img)
+
+            from kivy.uix.behaviors import ButtonBehavior
+            class ImgCell(ButtonBehavior, BoxLayout):
+                pass
+
+            btn_cell = ImgCell(size_hint=(None, None), size=(cell_size, cell_size))
+            btn_cell.add_widget(img)
+            btn_cell.bind(on_release=lambda _, p=path: _pick(p))
+            grid.add_widget(btn_cell)
+
+    def _pick(path):
+        mv.dismiss()
+        Clock.schedule_once(lambda dt: on_selected(path), 0.05)
+
+    def _full_picker(_):
+        mv.dismiss()
+        Clock.schedule_once(lambda dt: _request_image_pick(on_selected), 0.05)
+
+    full_btn.bind(on_release=_full_picker)
+    Clock.schedule_once(_load_gallery, 0.1)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3382,6 +3509,18 @@ class SCMessApp(App):
                 show_toast(f"@{sender}: {short_text}")
         except Exception as e:
             log.exception("notification failed: %s", e)
+            show_toast(f"@{sender}: {short_text}")
+
+    def _notify_new_message(self, sender, text):
+        title = f"SCmess: @{sender}"
+        short_text = (text[:90] + "…") if len(text) > 90 else text
+        try:
+            if platform == "android":
+                from plyer import notification
+                notification.notify(title=title, message=short_text, app_name="SCmess")
+            else:
+                show_toast(f"@{sender}: {short_text}")
+        except Exception:
             show_toast(f"@{sender}: {short_text}")
 
 
