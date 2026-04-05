@@ -1742,21 +1742,34 @@ class LaunchScreen(Screen):
                 halign="center", text_size=(Window.width * 0.8, None)))
             return
         for acc in accounts:
-            st = acc.get("status", "").strip()
-            title = f"@{acc['username']}"
-            text = f"{title}\n{st}" if st else title
-            outer = Button(
-                text=text,
-                size_hint=(1, None),
-                height=dp(72),
-                background_normal="",
-                background_color=t["btn_bg"],
-                color=t["btn_text"],
-                halign="left",
-                valign="middle",
-                text_size=(Window.width * 0.86, None),
-                padding=(dp(16), dp(10)),
-            )
+            row = BoxLayout(size_hint_y=None, height=dp(68), spacing=dp(10),
+                            padding=[dp(12), dp(8), dp(12), dp(8)])
+            with row.canvas.before:
+                Color(*t["btn_bg"])
+                RoundedRectangle(pos=row.pos, size=row.size, radius=[12])
+            row.bind(pos=lambda i, *_: _upd_row_bg(i), size=lambda i, *_: _upd_row_bg(i))
+            def _upd_row_bg(inst):
+                inst.canvas.before.clear()
+                with inst.canvas.before:
+                    Color(*t["btn_bg"])
+                    RoundedRectangle(pos=inst.pos, size=inst.size, radius=[12])
+            ava = make_avatar(acc["username"], dp(44), acc.get("avatar"))
+            row.add_widget(ava)
+            info = BoxLayout(orientation="vertical")
+            info.add_widget(Label(text=f"@{acc['username']}",
+                                  font_size="17sp", bold=True,
+                                  color=t["btn_text"], halign="left",
+                                  text_size=(Window.width * 0.65, None)))
+            st = acc.get("status", "")
+            if st:
+                info.add_widget(Label(text=st, font_size="12sp",
+                                      color=t["label_muted"], halign="left",
+                                      text_size=(Window.width * 0.65, None)))
+            row.add_widget(info)
+
+            outer = Button(size_hint=(1, None), height=dp(68),
+                           background_normal="", background_color=[0,0,0,0])
+            outer.add_widget(row)
             outer.bind(on_release=lambda _, a=acc: self._select_account(a))
             box.add_widget(outer)
 
@@ -3483,7 +3496,7 @@ class SCMessApp(App):
 
     def _notify_new_message(self, sender, text):
         title = f"SCmess: @{sender}"
-        short_text = (text[:90] + "...") if len(text) > 90 else text
+        short_text = (text[:90] + "…") if len(text) > 90 else text
         try:
             if platform == "android":
                 from plyer import notification
