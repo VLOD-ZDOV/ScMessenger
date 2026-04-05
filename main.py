@@ -5,7 +5,7 @@ SCmess — E2E-зашифрованный мессенджер
 Протокол: WebSocket JSON
 """
 
-import os, io, json, base64, threading, hashlib, time, sqlite3, re
+import os, io, json, base64, threading, hashlib, time, sqlite3, re, logging
 from collections import deque
 from datetime import datetime
 
@@ -41,6 +41,8 @@ from kivy.properties import (
 )
 from kivy.metrics import dp
 from kivy.graphics import Color, RoundedRectangle, Rectangle, Line, Ellipse
+
+log = logging.getLogger("scmess.client")
 
 HAS_PIL = False
 try:
@@ -1349,6 +1351,8 @@ class WSClient:
             return True
         except Exception as e:
             self.connected = False
+            if self._reconnect_enabled and self._last_host:
+                self._schedule_reconnect()
             raise e
 
     def _recv_loop(self):
@@ -2435,7 +2439,7 @@ def _avatar_from_path(path, callback):
 def _request_image_pick(on_path):
     """Запрашивает выбор одного изображения из галереи Android."""
     try:
-        from android.permissions import request_permissions, Permission, check_permission
+        from android.permissions import request_permissions, Permission
         from android import activity
         from jnius import autoclass
 
@@ -2517,7 +2521,7 @@ def _uri_to_path(uri):
         fos.close(); buf_stream.close(); stream.close()
         return tmp_path
     except Exception as e:
-        print(f"[URI] to path error: {e}")
+        log.exception("[URI] to path error: %s", e)
         return None
 
 
@@ -3491,8 +3495,21 @@ class SCMessApp(App):
             if chat._peer == username:
                 status = "онлайн" if is_online else "был(а) в сети"
                 chat.ids.peer_status_lbl.text = status
-        except Exception:
-            pass
+        except Exception as e:
+            log.exception("user status update failed: %s", e)
+
+    def _notify_new_message(self, sender, text):
+        title = f"SCmess: @{sender}"
+        short_text = (text[:90] + "...") if len(text) > 90 else text
+        try:
+            if platform == "android":
+                from plyer import notification
+                notification.notify(title=title, message=short_text, app_name="SCmess")
+            else:
+                show_toast(f"@{sender}: {short_text}")
+        except Exception as e:
+            log.exception("notification failed: %s", e)
+            show_toast(f"@{sender}: {short_text}")
 
     def _notify_new_message(self, sender, text):
         title = f"SCmess: @{sender}"
